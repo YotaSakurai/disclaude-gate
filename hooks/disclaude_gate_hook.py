@@ -46,6 +46,9 @@ def main() -> None:
         "request_id": request_id,
         "tool_name": tool_name,
         "tool_input": tool_input,
+        "session_id": hook_input.get("session_id", ""),
+        "transcript_path": hook_input.get("transcript_path", ""),
+        "cwd": hook_input.get("cwd", ""),
     }).encode()
 
     req = urllib.request.Request(

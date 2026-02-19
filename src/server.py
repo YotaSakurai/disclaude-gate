@@ -6,9 +6,7 @@ import asyncio
 import json
 import logging
 import os
-import signal
 import sys
-import textwrap
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -45,9 +43,84 @@ def _load_env() -> None:
 _load_env()
 
 DISCORD_TOKEN: str = os.environ.get("DISCORD_TOKEN", "")
-DISCORD_CHANNEL_ID: int = int(os.environ.get("DISCORD_CHANNEL_ID", "0"))
+
+def _parse_channel_id(raw: str) -> int:
+    """Accept a numeric ID or a Discord channel URL."""
+    raw = raw.strip().rstrip("/")
+    # https://discord.com/channels/SERVER_ID/CHANNEL_ID
+    if "/" in raw:
+        raw = raw.rsplit("/", 1)[-1]
+    return int(raw) if raw else 0
+
+DISCORD_CHANNEL_ID: int = _parse_channel_id(os.environ.get("DISCORD_CHANNEL_ID", "0"))
 APPROVAL_TIMEOUT: int = int(os.environ.get("APPROVAL_TIMEOUT", "300"))
 PORT: int = int(os.environ.get("PORT", "19280"))
+
+# ---------------------------------------------------------------------------
+# Session context helpers
+# ---------------------------------------------------------------------------
+
+def _extract_session_context(transcript_path: str, cwd: str) -> tuple[str, str]:
+    """Extract session title and recent conversation context from transcript.
+
+    Returns (session_title, recent_context).
+    """
+    session_title = ""
+    recent_context = ""
+
+    # Try to get session title from sessions-index.json
+    if transcript_path:
+        tp = Path(transcript_path)
+        project_dir = tp.parent
+        index_path = project_dir / "sessions-index.json"
+        session_id = tp.stem  # filename without .jsonl
+        if index_path.is_file():
+            try:
+                index_data = json.loads(index_path.read_text())
+                for session in index_data:
+                    if session.get("sessionId") == session_id:
+                        session_title = session.get("summary", "")[:100]
+                        break
+            except Exception:
+                pass
+
+    # Fallback title: use working directory name
+    if not session_title and cwd:
+        session_title = Path(cwd).name
+
+    # Extract recent user messages from transcript
+    if transcript_path and Path(transcript_path).is_file():
+        try:
+            lines = Path(transcript_path).read_text().splitlines()
+            # Read last N lines to find recent user messages
+            user_messages: list[str] = []
+            for line in reversed(lines[-50:]):
+                try:
+                    entry = json.loads(line)
+                except (json.JSONDecodeError, Exception):
+                    continue
+                # Claude Code transcript format: look for user messages
+                if entry.get("type") == "human" or entry.get("role") == "user":
+                    content = entry.get("content", "")
+                    if isinstance(content, list):
+                        # content can be a list of blocks
+                        texts = [b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"]
+                        content = " ".join(texts)
+                    if isinstance(content, str) and content.strip():
+                        # Skip system/hook messages
+                        if not content.startswith("{") and len(content) < 500:
+                            user_messages.append(content.strip())
+                            if len(user_messages) >= 2:
+                                break
+
+            if user_messages:
+                # Most recent first, reverse to chronological
+                user_messages.reverse()
+                recent_context = "\n".join(f"> {msg[:200]}" for msg in user_messages)
+        except Exception:
+            pass
+
+    return session_title, recent_context
 
 # ---------------------------------------------------------------------------
 # Pending request store
@@ -113,7 +186,7 @@ class ApprovalView(ui.View):
             req.reason = "Timed out waiting for approval"
             req.event.set()
 
-    @ui.button(label="Allow", style=discord.ButtonStyle.success, emoji="✅")
+    @ui.button(label="Allow", style=discord.ButtonStyle.success, emoji="\u2705")
     async def allow(self, interaction: discord.Interaction, button: ui.Button) -> None:
         req = _pending.get(self.request_id)
         if req is None:
@@ -125,7 +198,7 @@ class ApprovalView(ui.View):
         await interaction.response.send_message(embed=embed)
         self.stop()
 
-    @ui.button(label="Deny", style=discord.ButtonStyle.danger, emoji="❌")
+    @ui.button(label="Deny", style=discord.ButtonStyle.danger, emoji="\u274c")
     async def deny(self, interaction: discord.Interaction, button: ui.Button) -> None:
         req = _pending.get(self.request_id)
         if req is None:
@@ -137,7 +210,7 @@ class ApprovalView(ui.View):
         await interaction.response.send_message(embed=embed)
         self.stop()
 
-    @ui.button(label="Reply", style=discord.ButtonStyle.primary, emoji="💬")
+    @ui.button(label="Reply", style=discord.ButtonStyle.primary, emoji="\U0001f4ac")
     async def reply(self, interaction: discord.Interaction, button: ui.Button) -> None:
         await interaction.response.send_modal(ReplyModal(self.request_id))
 
@@ -170,6 +243,8 @@ async def handle_approval(request: web.Request) -> web.Response:
     request_id: str = body.get("request_id", "")
     tool_name: str = body.get("tool_name", "unknown")
     tool_input: dict = body.get("tool_input", {})
+    transcript_path: str = body.get("transcript_path", "")
+    cwd: str = body.get("cwd", "")
 
     if not request_id:
         return web.json_response({"error": "request_id required"}, status=400)
@@ -190,19 +265,37 @@ async def handle_approval(request: web.Request) -> web.Response:
             _pending.pop(request_id, None)
             return web.json_response({"error": "Discord channel not found"}, status=500)
 
+    # Extract session context (run in executor to avoid blocking)
+    loop = asyncio.get_running_loop()
+    session_title, recent_context = await loop.run_in_executor(
+        None, _extract_session_context, transcript_path, cwd
+    )
+
     # Format the tool input for display
     input_display = _format_tool_input(tool_name, tool_input)
 
     embed = discord.Embed(
-        title=f"🔧 {tool_name}",
+        title=f"\U0001f527 {tool_name}",
         description=input_display,
         color=discord.Color.gold(),
     )
-    embed.set_footer(text=f"ID: {request_id[:8]}… | Timeout: {APPROVAL_TIMEOUT}s")
+
+    # Add session info
+    if session_title:
+        embed.author = discord.EmbedAuthor(name=session_title)
+
+    # Add recent conversation context
+    if recent_context:
+        embed.add_field(name="Recent conversation", value=_truncate(recent_context, 1000), inline=False)
+
+    footer_parts = [f"ID: {request_id[:8]}\u2026", f"Timeout: {APPROVAL_TIMEOUT}s"]
+    if cwd:
+        footer_parts.append(Path(cwd).name)
+    embed.set_footer(text=" | ".join(footer_parts))
 
     view = ApprovalView(request_id)
     await channel.send(embed=embed, view=view)
-    log.info("Approval request sent to Discord: %s [%s]", tool_name, request_id[:8])
+    log.info("Approval request sent to Discord: %s [%s] session=%s", tool_name, request_id[:8], session_title or "?")
 
     # Wait for user response
     try:
@@ -230,7 +323,12 @@ def _format_tool_input(tool_name: str, tool_input: dict) -> str:
     """Format tool input for readable Discord display."""
     if tool_name == "Bash" and "command" in tool_input:
         cmd = tool_input["command"]
-        return f"```bash\n{_truncate(cmd, 1500)}\n```"
+        desc = tool_input.get("description", "")
+        parts = []
+        if desc:
+            parts.append(f"**{desc}**")
+        parts.append(f"```bash\n{_truncate(cmd, 1500)}\n```")
+        return "\n".join(parts)
 
     if tool_name == "Write" and "file_path" in tool_input:
         content = tool_input.get("content", "")
@@ -255,7 +353,7 @@ def _format_tool_input(tool_name: str, tool_input: dict) -> str:
 def _truncate(text: str, max_len: int) -> str:
     if len(text) <= max_len:
         return text
-    return text[:max_len] + "\n… (truncated)"
+    return text[:max_len] + "\n\u2026 (truncated)"
 
 # ---------------------------------------------------------------------------
 # Startup
