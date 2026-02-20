@@ -429,11 +429,29 @@ class StopReplyModal(ui.Modal, title="Reply to Claude"):
 
 
 class StopView(ui.View):
-    """Discord button: Reply to a stopped Claude session."""
+    """Discord buttons for replying to a stopped Claude session."""
 
     def __init__(self, tmux_pane: str) -> None:
         super().__init__(timeout=APPROVAL_TIMEOUT)
         self.tmux_pane = tmux_pane
+
+    async def _send_and_resolve(self, interaction: discord.Interaction, text: str) -> None:
+        loop = asyncio.get_running_loop()
+        success = await loop.run_in_executor(None, _tmux_send_keys, self.tmux_pane, text)
+        if success:
+            await interaction.response.defer()
+            await _mark_resolved(interaction.message, self, "\U0001f4ac", discord.Color.blue(), text)
+        else:
+            await interaction.response.send_message("Failed to send to tmux pane.", ephemeral=True)
+        self.stop()
+
+    @ui.button(label="Yes", style=discord.ButtonStyle.success)
+    async def yes(self, interaction: discord.Interaction, button: ui.Button) -> None:
+        await self._send_and_resolve(interaction, "yes")
+
+    @ui.button(label="No", style=discord.ButtonStyle.danger)
+    async def no(self, interaction: discord.Interaction, button: ui.Button) -> None:
+        await self._send_and_resolve(interaction, "no")
 
     @ui.button(label="Reply", style=discord.ButtonStyle.primary, emoji="\U0001f4ac")
     async def reply(self, interaction: discord.Interaction, button: ui.Button) -> None:
