@@ -560,7 +560,7 @@ class ApprovalView(ui.View):
         req.decision = "allow"
         req.event.set()
         await interaction.response.defer()
-        await _mark_resolved(interaction.message, self, "\U0001f513", discord.Color.green(), "Auto-approving all")
+        await _mark_resolved(interaction.message, self, "\u2705", discord.Color.green(), "Auto-approving all")
         self.stop()
 
 # ---------------------------------------------------------------------------
