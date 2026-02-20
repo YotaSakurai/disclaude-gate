@@ -441,26 +441,69 @@ class StopView(ui.View):
 
 
 class AskUserQuestionView(ui.View):
-    """Dynamic buttons for AskUserQuestion options + free-text Reply."""
+    """Handles AskUserQuestion — single-question uses buttons, multi-question uses dropdowns."""
 
-    def __init__(self, request_id: str, options: list[dict]) -> None:
+    def __init__(self, request_id: str, questions: list[dict]) -> None:
         super().__init__(timeout=APPROVAL_TIMEOUT)
         self.request_id = request_id
         self._original_message: discord.Message | None = None
-        # Add a button per option (Discord limit: max 25 components, 5 per row)
-        for i, opt in enumerate(options[:20]):
-            label = opt.get("label", f"Option {i + 1}")
-            # Truncate label to Discord's 80-char limit
-            if len(label) > 80:
-                label = label[:77] + "..."
-            button = ui.Button(
-                label=label,
-                style=discord.ButtonStyle.primary,
-                custom_id=f"ask_{request_id[:8]}_{i}",
+        self._answers: dict[int, str] = {}  # question index -> selected label(s)
+        self._question_count = len(questions)
+
+        if len(questions) <= 1:
+            # Single question — use buttons (original behavior)
+            options = questions[0].get("options", []) if questions else []
+            for i, opt in enumerate(options[:20]):
+                label = opt.get("label", f"Option {i + 1}")
+                if len(label) > 80:
+                    label = label[:77] + "..."
+                button = ui.Button(
+                    label=label,
+                    style=discord.ButtonStyle.primary,
+                    custom_id=f"ask_{request_id[:8]}_{i}",
+                )
+                button.callback = self._make_button_callback(label)
+                self.add_item(button)
+        else:
+            # Multi-question — use Select menus (dropdowns)
+            # Discord allows max 5 ActionRows, each with 1 Select or up to 5 buttons
+            for qi, q in enumerate(questions[:4]):
+                options = q.get("options", [])
+                is_multi = q.get("multiSelect", False)
+                header = q.get("header", f"Q{qi + 1}")
+                select_options = []
+                for oi, opt in enumerate(options[:25]):
+                    label = opt.get("label", f"Option {oi + 1}")
+                    desc = opt.get("description", "")
+                    if len(label) > 100:
+                        label = label[:97] + "..."
+                    if len(desc) > 100:
+                        desc = desc[:97] + "..."
+                    select_options.append(discord.SelectOption(
+                        label=label,
+                        description=desc or None,
+                        value=label,
+                    ))
+                select = ui.Select(
+                    placeholder=f"{header}: {q.get('question', '')[:90]}",
+                    options=select_options,
+                    min_values=1,
+                    max_values=len(select_options) if is_multi else 1,
+                    custom_id=f"ask_{request_id[:8]}_q{qi}",
+                )
+                select.callback = self._make_select_callback(qi)
+                self.add_item(select)
+            # Submit button in the last row
+            submit_btn = ui.Button(
+                label="Submit",
+                style=discord.ButtonStyle.success,
+                emoji="\u2705",
+                custom_id=f"ask_{request_id[:8]}_submit",
             )
-            button.callback = self._make_option_callback(label)
-            self.add_item(button)
-        # Add free-text reply button
+            submit_btn.callback = self._submit_callback
+            self.add_item(submit_btn)
+
+        # Free-text reply button (always present)
         reply_btn = ui.Button(
             label="Other",
             style=discord.ButtonStyle.secondary,
@@ -470,7 +513,9 @@ class AskUserQuestionView(ui.View):
         reply_btn.callback = self._reply_callback
         self.add_item(reply_btn)
 
-    def _make_option_callback(self, label: str):
+    # -- Single question: button callbacks --
+
+    def _make_button_callback(self, label: str):
         async def callback(interaction: discord.Interaction) -> None:
             req = _pending.get(self.request_id)
             if req is None:
@@ -485,6 +530,42 @@ class AskUserQuestionView(ui.View):
             await _mark_resolved(interaction.message, self, "\U0001f4ac", discord.Color.blue(), label)
             self.stop()
         return callback
+
+    # -- Multi-question: select + submit callbacks --
+
+    def _make_select_callback(self, question_index: int):
+        async def callback(interaction: discord.Interaction) -> None:
+            values = interaction.data.get("values", [])
+            self._answers[question_index] = ", ".join(values)
+            answered = len(self._answers)
+            await interaction.response.defer()
+        return callback
+
+    async def _submit_callback(self, interaction: discord.Interaction) -> None:
+        req = _pending.get(self.request_id)
+        if req is None:
+            await interaction.response.send_message("This request has already expired.", ephemeral=True)
+            return
+        if len(self._answers) < self._question_count:
+            unanswered = self._question_count - len(self._answers)
+            await interaction.response.send_message(
+                f"Please answer all questions ({unanswered} remaining).", ephemeral=True,
+            )
+            return
+        # Format all answers as text
+        parts = [f"Q{i + 1}: {self._answers[i]}" for i in sorted(self._answers)]
+        combined = "\n".join(parts)
+        req.decision = "deny"
+        req.reason = combined
+        req.event.set()
+        await interaction.response.send_message(
+            embed=discord.Embed(description=f"Submitted:\n{combined}", color=discord.Color.blue()),
+        )
+        await _mark_resolved(interaction.message, self, "\U0001f4ac", discord.Color.blue(),
+                             combined[:200])
+        self.stop()
+
+    # -- Common --
 
     async def _reply_callback(self, interaction: discord.Interaction) -> None:
         await interaction.response.send_modal(
@@ -661,8 +742,7 @@ async def handle_approval(request: web.Request) -> web.Response:
     # Use AskUserQuestion view if applicable
     if tool_name == "AskUserQuestion":
         questions = tool_input.get("questions", [])
-        options = questions[0].get("options", []) if questions else []
-        view = AskUserQuestionView(request_id, options)
+        view = AskUserQuestionView(request_id, questions)
     else:
         view = ApprovalView(request_id, session_id)
 
