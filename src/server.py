@@ -335,6 +335,29 @@ _auto_allow_sessions: set[str] = set()
 # Discord UI components
 # ---------------------------------------------------------------------------
 
+async def _mark_resolved(
+    msg: discord.Message,
+    view: ui.View,
+    status: str,
+    color: discord.Color,
+    detail: str = "",
+) -> None:
+    """Update the original approval message to show it's been resolved."""
+    # Update embed: prepend status, change color, add detail
+    embed = msg.embeds[0] if msg.embeds else discord.Embed()
+    embed.title = f"{status} {embed.title or ''}"
+    embed.color = color
+    if detail:
+        embed.add_field(name="Response", value=detail, inline=False)
+    # Disable all buttons
+    for item in view.children:
+        item.disabled = True
+    try:
+        await msg.edit(embed=embed, view=view)
+    except Exception:
+        pass
+
+
 class ReplyModal(ui.Modal, title="Reply to Claude"):
     """Modal for typing a custom reply message."""
 
@@ -345,9 +368,12 @@ class ReplyModal(ui.Modal, title="Reply to Claude"):
         max_length=1000,
     )
 
-    def __init__(self, request_id: str) -> None:
+    def __init__(self, request_id: str, original_message: discord.Message | None = None,
+                 parent_view: ui.View | None = None) -> None:
         super().__init__()
         self.request_id = request_id
+        self.original_message = original_message
+        self.parent_view = parent_view
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         req = _pending.get(self.request_id)
@@ -357,11 +383,12 @@ class ReplyModal(ui.Modal, title="Reply to Claude"):
         req.decision = "deny"
         req.reason = str(self.message)
         req.event.set()
-        embed = discord.Embed(
-            description=f"Replied: {self.message}",
-            color=discord.Color.blue(),
+        await interaction.response.send_message(
+            embed=discord.Embed(description=f"Replied: {self.message}", color=discord.Color.blue()),
         )
-        await interaction.response.send_message(embed=embed)
+        if self.original_message and self.parent_view:
+            await _mark_resolved(self.original_message, self.parent_view,
+                                 "\U0001f4ac", discord.Color.blue(), str(self.message)[:200])
 
 
 def _tmux_send_keys(tmux_pane: str, text: str) -> bool:
@@ -419,6 +446,7 @@ class AskUserQuestionView(ui.View):
     def __init__(self, request_id: str, options: list[dict]) -> None:
         super().__init__(timeout=APPROVAL_TIMEOUT)
         self.request_id = request_id
+        self._original_message: discord.Message | None = None
         # Add a button per option (Discord limit: max 25 components, 5 per row)
         for i, opt in enumerate(options[:20]):
             label = opt.get("label", f"Option {i + 1}")
@@ -451,13 +479,17 @@ class AskUserQuestionView(ui.View):
             req.decision = "deny"
             req.reason = label
             req.event.set()
-            embed = discord.Embed(description=f"Selected: {label}", color=discord.Color.blue())
-            await interaction.response.send_message(embed=embed)
+            await interaction.response.send_message(
+                embed=discord.Embed(description=f"Selected: {label}", color=discord.Color.blue()),
+            )
+            await _mark_resolved(interaction.message, self, "\U0001f4ac", discord.Color.blue(), label)
             self.stop()
         return callback
 
     async def _reply_callback(self, interaction: discord.Interaction) -> None:
-        await interaction.response.send_modal(ReplyModal(self.request_id))
+        await interaction.response.send_modal(
+            ReplyModal(self.request_id, interaction.message, self),
+        )
 
     async def on_timeout(self) -> None:
         req = _pending.get(self.request_id)
@@ -465,6 +497,8 @@ class AskUserQuestionView(ui.View):
             req.decision = "deny"
             req.reason = "Timed out waiting for response"
             req.event.set()
+            if self._original_message:
+                await _mark_resolved(self._original_message, self, "\u23f0", discord.Color.dark_grey())
 
 
 class ApprovalView(ui.View):
@@ -474,6 +508,7 @@ class ApprovalView(ui.View):
         super().__init__(timeout=APPROVAL_TIMEOUT)
         self.request_id = request_id
         self.session_id = session_id
+        self._original_message: discord.Message | None = None
 
     async def on_timeout(self) -> None:
         req = _pending.get(self.request_id)
@@ -481,6 +516,8 @@ class ApprovalView(ui.View):
             req.decision = "deny"
             req.reason = "Timed out waiting for approval"
             req.event.set()
+            if self._original_message:
+                await _mark_resolved(self._original_message, self, "\u23f0", discord.Color.dark_grey())
 
     @ui.button(label="Allow", style=discord.ButtonStyle.success, emoji="\u2705")
     async def allow(self, interaction: discord.Interaction, button: ui.Button) -> None:
@@ -490,8 +527,8 @@ class ApprovalView(ui.View):
             return
         req.decision = "allow"
         req.event.set()
-        embed = discord.Embed(description="Allowed", color=discord.Color.green())
-        await interaction.response.send_message(embed=embed)
+        await interaction.response.defer()
+        await _mark_resolved(interaction.message, self, "\u2705", discord.Color.green())
         self.stop()
 
     @ui.button(label="Deny", style=discord.ButtonStyle.danger, emoji="\u274c")
@@ -502,13 +539,15 @@ class ApprovalView(ui.View):
             return
         req.decision = "deny"
         req.event.set()
-        embed = discord.Embed(description="Denied", color=discord.Color.red())
-        await interaction.response.send_message(embed=embed)
+        await interaction.response.defer()
+        await _mark_resolved(interaction.message, self, "\u274c", discord.Color.red())
         self.stop()
 
     @ui.button(label="Reply", style=discord.ButtonStyle.primary, emoji="\U0001f4ac")
     async def reply(self, interaction: discord.Interaction, button: ui.Button) -> None:
-        await interaction.response.send_modal(ReplyModal(self.request_id))
+        await interaction.response.send_modal(
+            ReplyModal(self.request_id, interaction.message, self),
+        )
 
     @ui.button(label="Allow All", style=discord.ButtonStyle.secondary, emoji="\U0001f513")
     async def allow_all(self, interaction: discord.Interaction, button: ui.Button) -> None:
@@ -516,13 +555,12 @@ class ApprovalView(ui.View):
         if req is None:
             await interaction.response.send_message("This request has already expired.", ephemeral=True)
             return
-        # Mark this session for auto-approval
         if self.session_id:
             _auto_allow_sessions.add(self.session_id)
         req.decision = "allow"
         req.event.set()
-        embed = discord.Embed(description="Allowed \u2014 all future requests in this session will be auto-approved", color=discord.Color.green())
-        await interaction.response.send_message(embed=embed)
+        await interaction.response.defer()
+        await _mark_resolved(interaction.message, self, "\U0001f513", discord.Color.green(), "Auto-approving all")
         self.stop()
 
 # ---------------------------------------------------------------------------
@@ -630,7 +668,8 @@ async def handle_approval(request: web.Request) -> web.Response:
 
     # Send to session thread
     thread = await _get_or_create_thread(channel, session_id, session_title)
-    await thread.send(embed=embed, view=view)
+    sent_msg = await thread.send(embed=embed, view=view)
+    view._original_message = sent_msg
 
     # Post brief alert in main channel linking to the thread
     alert_title = session_title or "Unknown"
