@@ -789,13 +789,23 @@ async def handle_stop(request: web.Request) -> web.Response:
     stop_reason: str = body.get("stop_reason", "")
     tmux_pane: str = body.get("tmux_pane", "")
 
-    # Only notify for sessions that had approval requests
-    if session_id not in _sessions_with_approvals:
-        log.info("Stop ignored (no approvals): session=%s", session_id[:8] if session_id else "?")
-        return web.json_response({"status": "skipped", "reason": "no approvals in session"})
+    had_approvals = session_id in _sessions_with_approvals
 
-    # Don't clean up yet — session may continue after user replies
-    # _sessions_with_approvals will be cleaned up on next stop without reply
+    # For sessions without prior approvals, only notify if Claude's last
+    # output looks like a question (waiting for user input) AND tmux is available
+    if not had_approvals:
+        if not tmux_pane:
+            log.info("Stop ignored (no approvals, no tmux): session=%s", session_id[:8] if session_id else "?")
+            return web.json_response({"status": "skipped", "reason": "no approvals in session"})
+        # Check if Claude is asking a question
+        loop = asyncio.get_running_loop()
+        last_msg = await loop.run_in_executor(
+            None, _extract_last_assistant_message, transcript_path
+        )
+        last_line = last_msg.rstrip().rsplit("\n", 1)[-1] if last_msg else ""
+        if not last_line.rstrip().endswith(("?", "\uff1f")):
+            log.info("Stop ignored (no approvals, not a question): session=%s", session_id[:8] if session_id else "?")
+            return web.json_response({"status": "skipped", "reason": "no question detected"})
 
     await _bot_ready.wait()
 
@@ -814,9 +824,19 @@ async def handle_stop(request: web.Request) -> web.Response:
         None, _extract_last_assistant_message, transcript_path
     )
 
+    # Distinguish "question waiting" from "session done"
+    last_line = last_message.rstrip().rsplit("\n", 1)[-1] if last_message else ""
+    is_question = last_line.rstrip().endswith(("?", "\uff1f"))
+
     title_prefix = f"[{session_title}] " if session_title else ""
+    if is_question and tmux_pane:
+        title_icon = "\u2753"  # ❓ Waiting for input
+        title_label = "Waiting for input"
+    else:
+        title_icon = "\u2705"  # ✅ Session finished
+        title_label = "Session finished"
     embed = discord.Embed(
-        title=f"{title_prefix}\u2705 Session finished",
+        title=f"{title_prefix}{title_icon} {title_label}",
         description=_truncate(last_message, 2000) if last_message else "No output captured.",
         color=_session_color(session_id),
     )
