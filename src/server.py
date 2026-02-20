@@ -99,16 +99,18 @@ def _extract_session_context(transcript_path: str, cwd: str) -> tuple[str, str]:
                     entry = json.loads(line)
                 except (json.JSONDecodeError, Exception):
                     continue
-                # Claude Code transcript format: look for user messages
-                if entry.get("type") == "human" or entry.get("role") == "user":
-                    content = entry.get("content", "")
+                # Claude Code transcript format: entry.type == "human", content in entry.message.content[]
+                if entry.get("type") == "human":
+                    msg = entry.get("message", {})
+                    if not isinstance(msg, dict):
+                        continue
+                    content = msg.get("content", "")
                     if isinstance(content, list):
-                        # content can be a list of blocks
                         texts = [b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"]
                         content = " ".join(texts)
                     if isinstance(content, str) and content.strip():
                         # Skip system/hook messages
-                        if not content.startswith("{") and len(content) < 500:
+                        if not content.startswith("{") and not content.startswith("<") and len(content) < 500:
                             user_messages.append(content.strip())
                             if len(user_messages) >= 2:
                                 break
@@ -121,6 +123,33 @@ def _extract_session_context(transcript_path: str, cwd: str) -> tuple[str, str]:
             pass
 
     return session_title, recent_context
+
+
+def _extract_last_assistant_message(transcript_path: str) -> str:
+    """Extract the last assistant text message from the transcript."""
+    if not transcript_path or not Path(transcript_path).is_file():
+        return ""
+    try:
+        lines = Path(transcript_path).read_text().splitlines()
+        for line in reversed(lines[-100:]):
+            try:
+                entry = json.loads(line)
+            except (json.JSONDecodeError, Exception):
+                continue
+            # Transcript format: entry.type == "assistant", content in entry.message.content[]
+            if entry.get("type") == "assistant":
+                msg = entry.get("message", {})
+                if not isinstance(msg, dict):
+                    continue
+                content = msg.get("content", [])
+                if isinstance(content, list):
+                    texts = [b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"]
+                    result = "\n".join(t for t in texts if t.strip())
+                    if result.strip():
+                        return result.strip()
+    except Exception:
+        pass
+    return ""
 
 # ---------------------------------------------------------------------------
 # Pending request store
@@ -138,6 +167,9 @@ class PendingRequest:
 
 # request_id -> PendingRequest
 _pending: dict[str, PendingRequest] = {}
+
+# Sessions that have had at least one approval request go through
+_sessions_with_approvals: set[str] = set()
 
 # ---------------------------------------------------------------------------
 # Discord UI components
@@ -246,8 +278,14 @@ async def handle_approval(request: web.Request) -> web.Response:
     transcript_path: str = body.get("transcript_path", "")
     cwd: str = body.get("cwd", "")
 
+    session_id: str = body.get("session_id", "")
+
     if not request_id:
         return web.json_response({"error": "request_id required"}, status=400)
+
+    # Track sessions that have gone through approval
+    if session_id:
+        _sessions_with_approvals.add(session_id)
 
     # Create pending request
     req = PendingRequest(request_id=request_id, tool_name=tool_name, tool_input=tool_input)
@@ -312,6 +350,63 @@ async def handle_approval(request: web.Request) -> web.Response:
 
     log.info("Returning decision: %s (reason=%s)", result["decision"], result.get("reason"))
     return web.json_response(result)
+
+
+async def handle_stop(request: web.Request) -> web.Response:
+    """Receive a stop notification — Claude session has finished."""
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid json"}, status=400)
+
+    session_id: str = body.get("session_id", "")
+    transcript_path: str = body.get("transcript_path", "")
+    cwd: str = body.get("cwd", "")
+    stop_reason: str = body.get("stop_reason", "")
+
+    # Only notify for sessions that had approval requests
+    if session_id not in _sessions_with_approvals:
+        log.info("Stop ignored (no approvals): session=%s", session_id[:8] if session_id else "?")
+        return web.json_response({"status": "skipped", "reason": "no approvals in session"})
+
+    # Clean up tracking
+    _sessions_with_approvals.discard(session_id)
+
+    await _bot_ready.wait()
+
+    channel = bot.get_channel(DISCORD_CHANNEL_ID)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(DISCORD_CHANNEL_ID)
+        except Exception:
+            return web.json_response({"error": "Discord channel not found"}, status=500)
+
+    loop = asyncio.get_running_loop()
+    session_title, _ = await loop.run_in_executor(
+        None, _extract_session_context, transcript_path, cwd
+    )
+    last_message = await loop.run_in_executor(
+        None, _extract_last_assistant_message, transcript_path
+    )
+
+    embed = discord.Embed(
+        title="\u2705 Session finished",
+        description=_truncate(last_message, 2000) if last_message else "No output captured.",
+        color=discord.Color.green(),
+    )
+
+    if session_title:
+        embed.set_author(name=session_title)
+
+    if stop_reason:
+        embed.add_field(name="Reason", value=stop_reason, inline=True)
+    if cwd:
+        embed.set_footer(text=Path(cwd).name)
+
+    await channel.send(embed=embed)
+    log.info("Stop notification sent to Discord: session=%s", session_title or "?")
+
+    return web.json_response({"status": "ok"})
 
 
 async def handle_health(request: web.Request) -> web.Response:
@@ -379,6 +474,7 @@ async def _async_main() -> None:
     # HTTP server
     app = web.Application()
     app.router.add_post("/approve", handle_approval)
+    app.router.add_post("/notify-stop", handle_stop)
     app.router.add_get("/health", handle_health)
 
     await _run_http(app)
