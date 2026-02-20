@@ -4,11 +4,27 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 import sys
 import urllib.error
 import urllib.request
 
 SERVER_URL = "http://127.0.0.1:19280"
+
+
+def _get_tmux_pane() -> str:
+    """Get the current tmux pane ID, or empty string if not in tmux."""
+    if not os.environ.get("TMUX"):
+        return ""
+    try:
+        result = subprocess.run(
+            ["tmux", "display-message", "-p", "#{pane_id}"],
+            capture_output=True, text=True, timeout=5,
+        )
+        return result.stdout.strip() if result.returncode == 0 else ""
+    except Exception:
+        return ""
 
 
 def main() -> None:
@@ -23,6 +39,7 @@ def main() -> None:
         "transcript_path": hook_input.get("transcript_path", ""),
         "cwd": hook_input.get("cwd", ""),
         "stop_reason": hook_input.get("stop_reason", ""),
+        "tmux_pane": _get_tmux_pane(),
     }).encode()
 
     req = urllib.request.Request(

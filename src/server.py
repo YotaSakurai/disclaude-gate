@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -204,6 +205,55 @@ class ReplyModal(ui.Modal, title="Reply to Claude"):
         await interaction.response.send_message(embed=embed)
 
 
+def _tmux_send_keys(tmux_pane: str, text: str) -> bool:
+    """Send text to a tmux pane as keyboard input."""
+    try:
+        subprocess.run(
+            ["tmux", "send-keys", "-t", tmux_pane, text, "Enter"],
+            capture_output=True, timeout=5, check=True,
+        )
+        return True
+    except Exception:
+        return False
+
+
+class StopReplyModal(ui.Modal, title="Reply to Claude"):
+    """Modal for typing a reply to a stopped Claude session via tmux."""
+
+    message = ui.TextInput(
+        label="Message",
+        style=discord.TextStyle.paragraph,
+        placeholder="e.g. Yes, go ahead / Use approach A",
+        max_length=1000,
+    )
+
+    def __init__(self, tmux_pane: str) -> None:
+        super().__init__()
+        self.tmux_pane = tmux_pane
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        text = str(self.message).strip()
+        loop = asyncio.get_running_loop()
+        success = await loop.run_in_executor(None, _tmux_send_keys, self.tmux_pane, text)
+        if success:
+            embed = discord.Embed(description=f"Sent: {text}", color=discord.Color.blue())
+            await interaction.response.send_message(embed=embed)
+        else:
+            await interaction.response.send_message("Failed to send to tmux pane.", ephemeral=True)
+
+
+class StopView(ui.View):
+    """Discord button: Reply to a stopped Claude session."""
+
+    def __init__(self, tmux_pane: str) -> None:
+        super().__init__(timeout=APPROVAL_TIMEOUT)
+        self.tmux_pane = tmux_pane
+
+    @ui.button(label="Reply", style=discord.ButtonStyle.primary, emoji="\U0001f4ac")
+    async def reply(self, interaction: discord.Interaction, button: ui.Button) -> None:
+        await interaction.response.send_modal(StopReplyModal(self.tmux_pane))
+
+
 class ApprovalView(ui.View):
     """Discord buttons: Allow / Deny / Reply."""
 
@@ -363,14 +413,15 @@ async def handle_stop(request: web.Request) -> web.Response:
     transcript_path: str = body.get("transcript_path", "")
     cwd: str = body.get("cwd", "")
     stop_reason: str = body.get("stop_reason", "")
+    tmux_pane: str = body.get("tmux_pane", "")
 
     # Only notify for sessions that had approval requests
     if session_id not in _sessions_with_approvals:
         log.info("Stop ignored (no approvals): session=%s", session_id[:8] if session_id else "?")
         return web.json_response({"status": "skipped", "reason": "no approvals in session"})
 
-    # Clean up tracking
-    _sessions_with_approvals.discard(session_id)
+    # Don't clean up yet — session may continue after user replies
+    # _sessions_with_approvals will be cleaned up on next stop without reply
 
     await _bot_ready.wait()
 
@@ -403,8 +454,16 @@ async def handle_stop(request: web.Request) -> web.Response:
     if cwd:
         embed.set_footer(text=Path(cwd).name)
 
-    await channel.send(embed=embed)
-    log.info("Stop notification sent to Discord: session=%s", session_title or "?")
+    # If tmux pane is available, add Reply button
+    if tmux_pane:
+        view = StopView(tmux_pane)
+        await channel.send(embed=embed, view=view)
+        log.info("Stop notification sent to Discord (with reply): session=%s tmux=%s", session_title or "?", tmux_pane)
+    else:
+        await channel.send(embed=embed)
+        log.info("Stop notification sent to Discord: session=%s", session_title or "?")
+        # No tmux = no way to reply, so clean up tracking
+        _sessions_with_approvals.discard(session_id)
 
     return web.json_response({"status": "ok"})
 
