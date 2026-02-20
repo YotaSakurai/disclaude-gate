@@ -141,6 +141,59 @@ def _extract_session_context(transcript_path: str, cwd: str) -> tuple[str, str]:
     return session_title, recent_context
 
 
+def _extract_agent_name(transcript_path: str) -> str:
+    """Extract agent role name from transcript path and team config.
+
+    For subagents, transcript path looks like:
+      .../subagents/agent-a8cad23.jsonl
+    We extract the agent ID and look it up in team configs.
+    """
+    if not transcript_path:
+        return ""
+    tp = Path(transcript_path)
+
+    # Check if this is a subagent transcript
+    if tp.parent.name != "subagents":
+        return ""
+
+    # Extract agent ID from filename: "agent-a8cad23.jsonl" -> "a8cad23"
+    agent_id = tp.stem.replace("agent-", "")
+    if not agent_id or agent_id.startswith("compact"):
+        return ""
+
+    # Search team configs for this agent ID
+    teams_dir = Path.home() / ".claude" / "teams"
+    if not teams_dir.is_dir():
+        return ""
+
+    for team_dir in teams_dir.iterdir():
+        config_path = team_dir / "config.json"
+        if not config_path.is_file():
+            continue
+        try:
+            config = json.loads(config_path.read_text())
+            for member in config.get("members", []):
+                member_agent_id = member.get("agentId", "")
+                # agentId format: "agent-name@team-name" or just an ID
+                if agent_id in member_agent_id:
+                    return member.get("name", "")
+        except Exception:
+            continue
+
+    # Fallback: try reading agentId from transcript itself
+    if Path(transcript_path).is_file():
+        try:
+            first_line = Path(transcript_path).read_text().split("\n", 1)[0]
+            entry = json.loads(first_line)
+            slug = entry.get("slug", "")
+            if slug:
+                return slug
+        except Exception:
+            pass
+
+    return agent_id
+
+
 def _extract_last_assistant_message(transcript_path: str) -> str:
     """Extract the last assistant text message from the transcript."""
     if not transcript_path or not Path(transcript_path).is_file():
@@ -221,6 +274,9 @@ _pending: dict[str, PendingRequest] = {}
 
 # Sessions that have had at least one approval request go through
 _sessions_with_approvals: set[str] = set()
+
+# Sessions where user has chosen "Allow All" — auto-approve everything
+_auto_allow_sessions: set[str] = set()
 
 # ---------------------------------------------------------------------------
 # Discord UI components
@@ -359,11 +415,12 @@ class AskUserQuestionView(ui.View):
 
 
 class ApprovalView(ui.View):
-    """Discord buttons: Allow / Deny / Reply."""
+    """Discord buttons: Allow / Deny / Reply / Allow All."""
 
-    def __init__(self, request_id: str) -> None:
+    def __init__(self, request_id: str, session_id: str = "") -> None:
         super().__init__(timeout=APPROVAL_TIMEOUT)
         self.request_id = request_id
+        self.session_id = session_id
 
     async def on_timeout(self) -> None:
         req = _pending.get(self.request_id)
@@ -399,6 +456,21 @@ class ApprovalView(ui.View):
     @ui.button(label="Reply", style=discord.ButtonStyle.primary, emoji="\U0001f4ac")
     async def reply(self, interaction: discord.Interaction, button: ui.Button) -> None:
         await interaction.response.send_modal(ReplyModal(self.request_id))
+
+    @ui.button(label="Allow All", style=discord.ButtonStyle.secondary, emoji="\U0001f513")
+    async def allow_all(self, interaction: discord.Interaction, button: ui.Button) -> None:
+        req = _pending.get(self.request_id)
+        if req is None:
+            await interaction.response.send_message("This request has already expired.", ephemeral=True)
+            return
+        # Mark this session for auto-approval
+        if self.session_id:
+            _auto_allow_sessions.add(self.session_id)
+        req.decision = "allow"
+        req.event.set()
+        embed = discord.Embed(description="Allowed \u2014 all future requests in this session will be auto-approved", color=discord.Color.green())
+        await interaction.response.send_message(embed=embed)
+        self.stop()
 
 # ---------------------------------------------------------------------------
 # Discord bot
@@ -441,6 +513,11 @@ async def handle_approval(request: web.Request) -> web.Response:
     if session_id:
         _sessions_with_approvals.add(session_id)
 
+    # Auto-approve if "Allow All" was previously selected for this session
+    if session_id in _auto_allow_sessions:
+        log.info("Auto-approved (Allow All): %s [%s]", tool_name, session_id[:8])
+        return web.json_response({"decision": "allow"})
+
     # Create pending request
     req = PendingRequest(request_id=request_id, tool_name=tool_name, tool_input=tool_input)
     _pending[request_id] = req
@@ -462,13 +539,18 @@ async def handle_approval(request: web.Request) -> web.Response:
     session_title, recent_context = await loop.run_in_executor(
         None, _extract_session_context, transcript_path, cwd
     )
+    agent_name = await loop.run_in_executor(
+        None, _extract_agent_name, transcript_path
+    )
 
     # Format the tool input for display
     input_display = _format_tool_input(tool_name, tool_input)
 
+    # Build title: [session] 🔧 Tool  or  [session] 🤖 agent > 🔧 Tool
     title_prefix = f"[{session_title}] " if session_title else ""
+    agent_prefix = f"\U0001f916 {agent_name} \u203a " if agent_name else ""
     embed = discord.Embed(
-        title=f"{title_prefix}\U0001f527 {tool_name}",
+        title=f"{title_prefix}{agent_prefix}\U0001f527 {tool_name}",
         description=input_display,
         color=_session_color(session_id),
     )
@@ -488,7 +570,7 @@ async def handle_approval(request: web.Request) -> web.Response:
         options = questions[0].get("options", []) if questions else []
         view = AskUserQuestionView(request_id, options)
     else:
-        view = ApprovalView(request_id)
+        view = ApprovalView(request_id, session_id)
 
     # Send to session thread
     thread = await _get_or_create_thread(channel, session_id, session_title)
