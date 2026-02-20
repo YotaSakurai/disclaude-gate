@@ -150,57 +150,61 @@ def _extract_session_context(transcript_path: str, cwd: str) -> tuple[str, str]:
     return session_title, recent_context
 
 
-def _extract_agent_name(transcript_path: str) -> str:
-    """Extract agent role name from transcript path and team config.
+def _extract_agent_name(transcript_path: str, tmux_pane: str = "") -> str:
+    """Extract agent role name for Agent Teams and Task subagents.
 
-    For subagents, transcript path looks like:
-      .../subagents/agent-a8cad23.jsonl
-    We extract the agent ID and look it up in team configs.
+    Strategy:
+    1. Match tmux pane ID against team config members (tmux-based Agent Teams)
+    2. For Task subagents, read description from parent transcript's queue-operation
     """
+    teams_dir = Path.home() / ".claude" / "teams"
+
+    # Strategy 1: Match tmux pane against team config
+    if tmux_pane and teams_dir.is_dir():
+        for team_dir in teams_dir.iterdir():
+            config_path = team_dir / "config.json"
+            if not config_path.is_file():
+                continue
+            try:
+                config = json.loads(config_path.read_text())
+                for member in config.get("members", []):
+                    if member.get("tmuxPaneId") == tmux_pane:
+                        name = member.get("name", "")
+                        # Skip team-lead (it's the main session)
+                        if name and name != "team-lead":
+                            return name
+            except Exception:
+                continue
+
     if not transcript_path:
         return ""
     tp = Path(transcript_path)
 
-    # Check if this is a subagent transcript
-    if tp.parent.name != "subagents":
-        return ""
+    # Strategy 2: Task subagent — read description from parent transcript
+    if tp.parent.name == "subagents":
+        agent_id = tp.stem.replace("agent-", "")
+        if agent_id and not agent_id.startswith("compact"):
+            # Parent transcript: {session_id}.jsonl in grandparent directory
+            parent_transcript = tp.parent.parent.parent / f"{tp.parent.parent.name}.jsonl"
+            if parent_transcript.is_file():
+                needle = f'"task_id":"{agent_id}"'
+                try:
+                    with open(parent_transcript) as f:
+                        for line in f:
+                            if needle not in line:
+                                continue
+                            entry = json.loads(line)
+                            content = entry.get("content", "")
+                            if isinstance(content, str) and "description" in content:
+                                inner = json.loads(content)
+                                desc = inner.get("description", "")
+                                if desc:
+                                    return desc
+                            break  # found the task entry, stop searching
+                except Exception:
+                    pass
 
-    # Extract agent ID from filename: "agent-a8cad23.jsonl" -> "a8cad23"
-    agent_id = tp.stem.replace("agent-", "")
-    if not agent_id or agent_id.startswith("compact"):
-        return ""
-
-    # Search team configs for this agent ID
-    teams_dir = Path.home() / ".claude" / "teams"
-    if not teams_dir.is_dir():
-        return ""
-
-    for team_dir in teams_dir.iterdir():
-        config_path = team_dir / "config.json"
-        if not config_path.is_file():
-            continue
-        try:
-            config = json.loads(config_path.read_text())
-            for member in config.get("members", []):
-                member_agent_id = member.get("agentId", "")
-                # agentId format: "agent-name@team-name" or just an ID
-                if agent_id in member_agent_id:
-                    return member.get("name", "")
-        except Exception:
-            continue
-
-    # Fallback: try reading agentId from transcript itself
-    if Path(transcript_path).is_file():
-        try:
-            first_line = Path(transcript_path).read_text().split("\n", 1)[0]
-            entry = json.loads(first_line)
-            slug = entry.get("slug", "")
-            if slug:
-                return slug
-        except Exception:
-            pass
-
-    return agent_id
+    return ""
 
 
 def _extract_last_assistant_message(transcript_path: str) -> str:
@@ -588,9 +592,12 @@ async def handle_approval(request: web.Request) -> web.Response:
     session_title, recent_context = await loop.run_in_executor(
         None, _extract_session_context, transcript_path, cwd
     )
+    tmux_pane: str = body.get("tmux_pane", "")
     agent_name = await loop.run_in_executor(
-        None, _extract_agent_name, transcript_path
+        None, _extract_agent_name, transcript_path, tmux_pane
     )
+    if agent_name:
+        log.info("Agent identified: %s (tmux=%s)", agent_name, tmux_pane or "n/a")
 
     # Format the tool input for display
     input_display = _format_tool_input(tool_name, tool_input)

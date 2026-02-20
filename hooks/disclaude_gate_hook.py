@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -42,14 +44,21 @@ def main() -> None:
 
     request_id = str(uuid.uuid4())
 
-    payload = json.dumps({
-        "request_id": request_id,
-        "tool_name": tool_name,
-        "tool_input": tool_input,
-        "session_id": hook_input.get("session_id", ""),
-        "transcript_path": hook_input.get("transcript_path", ""),
-        "cwd": hook_input.get("cwd", ""),
-    }).encode()
+    # Forward all hook fields plus our request_id and tmux pane
+    payload_dict = dict(hook_input)
+    payload_dict["request_id"] = request_id
+    # Capture tmux pane for Agent Teams identification
+    if os.environ.get("TMUX"):
+        try:
+            proc = subprocess.run(
+                ["tmux", "display-message", "-p", "#{pane_id}"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if proc.returncode == 0 and proc.stdout.strip():
+                payload_dict["tmux_pane"] = proc.stdout.strip()
+        except Exception:
+            pass
+    payload = json.dumps(payload_dict).encode()
 
     req = urllib.request.Request(
         f"{SERVER_URL}/approve",
