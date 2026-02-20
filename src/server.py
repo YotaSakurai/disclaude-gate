@@ -58,6 +58,21 @@ APPROVAL_TIMEOUT: int = int(os.environ.get("APPROVAL_TIMEOUT", "300"))
 PORT: int = int(os.environ.get("PORT", "19280"))
 
 # ---------------------------------------------------------------------------
+# Session color helper
+# ---------------------------------------------------------------------------
+
+def _session_color(session_id: str) -> discord.Color:
+    """Generate a stable, visually distinct color from a session ID."""
+    if not session_id:
+        return discord.Color.gold()
+    h = hash(session_id) & 0xFFFFFF
+    # Boost saturation by keeping values away from grey
+    r = ((h >> 16) & 0xFF) | 0x40
+    g = ((h >> 8) & 0xFF) | 0x40
+    b = (h & 0xFF) | 0x40
+    return discord.Color.from_rgb(r & 0xFF, g & 0xFF, b & 0xFF)
+
+# ---------------------------------------------------------------------------
 # Session context helpers
 # ---------------------------------------------------------------------------
 
@@ -419,7 +434,7 @@ async def handle_approval(request: web.Request) -> web.Response:
     embed = discord.Embed(
         title=f"\U0001f527 {tool_name}",
         description=input_display,
-        color=discord.Color.gold(),
+        color=_session_color(session_id),
     )
 
     # Add session info
@@ -503,7 +518,7 @@ async def handle_stop(request: web.Request) -> web.Response:
     embed = discord.Embed(
         title="\u2705 Session finished",
         description=_truncate(last_message, 2000) if last_message else "No output captured.",
-        color=discord.Color.green(),
+        color=_session_color(session_id),
     )
 
     if session_title:
