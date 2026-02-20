@@ -11,22 +11,35 @@ Claude CLI (WSL/Linux/macOS)          Discord (Phone)
   │   ↓ PreToolUse Hook fires           │
   │   ↓                                 │
   │   → HTTP POST to local server ──────┤
-  │                                     │  🔧 Bash
+  │                                     │  [disclaude-gate] 🔧 Bash
   │     (waiting for response...)       │  rm -rf /tmp/old
   │                                     │
-  │                                     │  [✅ Allow] [❌ Deny] [💬 Reply]
+  │                                     │  [✅ Allow] [❌ Deny] [💬 Reply] [🔓 Allow All]
   │                                     │
   │   ← decision returned ─────────────┤  *tap*
   │   ↓                                 │
   ├─ Tool executes (or is denied)       │
 ```
 
+## Features
+
+- **Allow / Deny / Reply** — approve, reject, or send custom instructions from your phone
+- **Allow All** — auto-approve all remaining requests in a session (great for Agent Teams)
+- **AskUserQuestion support** — multiple-choice questions shown as tappable Discord buttons
+- **Session threads** — each Claude session gets its own Discord thread for clean separation
+- **Session colors** — each session has a unique embed color for visual distinction
+- **Agent Teams support** — shows which agent role (researcher, tester, etc.) is requesting
+- **Completion notifications** — get notified when a session finishes, with the last output
+- **tmux reply** — reply to Claude's questions from Discord when running in tmux
+- **Graceful fallback** — if the server is down, Claude Code falls back to its normal terminal prompt
+- **Auto-allow list** — read-only tools (Read, Glob, Grep, etc.) skip Discord entirely
+
 ## How It Works
 
 1. Claude Code fires a **PreToolUse hook** before executing any tool (Bash, Edit, Write, etc.)
 2. The hook script sends the tool details to a **local HTTP server**
-3. The server forwards it to your **Discord channel** with interactive buttons
-4. You tap **Allow**, **Deny**, or **Reply** (with a custom message) on your phone
+3. The server creates a **Discord thread** for the session and posts an embed with interactive buttons
+4. You tap a button or type a reply on your phone
 5. The decision is returned to Claude Code, which proceeds accordingly
 
 **Key difference from full-remote solutions:** disclaude-gate only notifies you when approval is needed. Your normal CLI workflow stays untouched.
@@ -47,7 +60,7 @@ Claude CLI (WSL/Linux/macOS)          Discord (Phone)
 4. Enable **Message Content Intent** under Privileged Gateway Intents
 5. Go to **OAuth2** → **URL Generator**:
    - Scopes: `bot`
-   - Bot Permissions: `Send Messages`, `Use Slash Commands`
+   - Bot Permissions: `Send Messages`, `Create Public Threads`, `Send Messages in Threads`
 6. Open the generated URL to invite the bot to your server
 7. Create a dedicated channel (e.g. `#claude-approvals`) and copy its ID
    - Enable Developer Mode in Discord settings → right-click channel → Copy Channel ID
@@ -55,17 +68,17 @@ Claude CLI (WSL/Linux/macOS)          Discord (Phone)
 ### 2. Install disclaude-gate
 
 ```bash
-git clone https://github.com/your-username/disclaude-gate.git
+git clone https://github.com/YotaSakurai/disclaude-gate.git
 cd disclaude-gate
-./install.sh
+python3 -m venv .venv
+.venv/bin/pip install -e .
 ```
 
-The installer will:
-- Install Python dependencies
-- Create a `.env` file for your configuration
-- Register the hook in Claude Code's `~/.claude/settings.json`
-
 ### 3. Configure
+
+```bash
+cp .env.example .env
+```
 
 Edit `.env`:
 
@@ -74,28 +87,95 @@ DISCORD_TOKEN=your-bot-token-here
 DISCORD_CHANNEL_ID=123456789012345678
 ```
 
-### 4. Run
+You can also paste a full channel URL — the ID will be extracted automatically.
+
+### 4. Register Hooks
+
+Add to `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/path/to/disclaude-gate/.venv/bin/python3 /path/to/disclaude-gate/hooks/disclaude_gate_hook.py"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/path/to/disclaude-gate/.venv/bin/python3 /path/to/disclaude-gate/hooks/disclaude_gate_stop_hook.py"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Or run `./install.sh` to set this up automatically.
+
+### 5. Run
 
 ```bash
-# Start the server (keep running in background)
-disclaude-gate
+# Start the server
+.venv/bin/disclaude-gate
 
 # In another terminal, use Claude Code as normal
 claude
 ```
+
+## Running as a Service (recommended)
+
+Run disclaude-gate as a systemd user service so it starts automatically:
+
+```bash
+mkdir -p ~/.config/systemd/user
+
+cat > ~/.config/systemd/user/disclaude-gate.service << EOF
+[Unit]
+Description=disclaude-gate server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/path/to/disclaude-gate
+ExecStart=/path/to/disclaude-gate/.venv/bin/python3 -m src.server
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target
+EOF
+
+systemctl --user enable --now disclaude-gate
+```
+
+Check status: `systemctl --user status disclaude-gate`
 
 ## Configuration
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `DISCORD_TOKEN` | (required) | Discord bot token |
-| `DISCORD_CHANNEL_ID` | (required) | Channel ID for approval messages |
+| `DISCORD_CHANNEL_ID` | (required) | Channel ID or URL for the approval channel |
 | `APPROVAL_TIMEOUT` | `300` | Seconds to wait before auto-deny |
 | `PORT` | `19280` | Local HTTP server port |
 
 ### Auto-Allow List
 
-By default, read-only tools (`Read`, `Glob`, `Grep`, etc.) are auto-allowed without sending a Discord notification. Edit the `AUTO_ALLOW_TOOLS` set in `hooks/disclaude_gate_hook.py` to customize:
+By default, read-only tools are auto-allowed without sending a Discord notification. Edit `AUTO_ALLOW_TOOLS` in `hooks/disclaude_gate_hook.py` to customize:
 
 ```python
 AUTO_ALLOW_TOOLS = {
@@ -111,63 +191,61 @@ AUTO_ALLOW_TOOLS = {
 
 ## Usage
 
-### Allow / Deny
-Tap the button. Claude Code proceeds or stops accordingly.
+### Allow / Deny / Reply
+Tap **Allow** or **Deny**. Tap **Reply** to type a custom message — Claude reads it and adjusts its approach.
 
-### Reply
-Tap **Reply** → type a message → Claude reads it and adjusts its approach.
+### Allow All
+Tap **Allow All** to auto-approve all remaining requests in that session. Useful when running Agent Teams with many parallel agents.
 
-Example replies:
-- "Don't delete that file, make a backup first"
-- "Use pip instead of npm"
-- "Skip this step and move on to testing"
+### AskUserQuestion
+When Claude asks a multiple-choice question, each option appears as a tappable button. Tap **Other** for free-text input.
 
-### Graceful Fallback
-If the server is not running, the hook silently falls through and Claude Code shows its normal terminal prompt. You can always approve locally.
+### Session Threads
+Each Claude session automatically gets its own Discord thread, keeping conversations organized. Threads are named after the session and auto-archive after 1 hour of inactivity.
 
-## Running as a Service
+### Agent Teams
+When using Claude Code's Agent Teams feature, the agent's role name is displayed in the notification title (e.g. `🤖 researcher › 🔧 Bash`), so you know which team member is requesting approval.
 
-### systemd (Linux)
+### Completion Notifications
+When a session that went through approval finishes, you get a notification with Claude's last output — no need to keep checking the terminal.
+
+### tmux Reply (optional)
+Run Claude in tmux to enable replying to Claude's questions from Discord:
 
 ```bash
-cat > ~/.config/systemd/user/disclaude-gate.service << EOF
-[Unit]
-Description=disclaude-gate server
-After=network.target
-
-[Service]
-Type=simple
-WorkingDirectory=/path/to/disclaude-gate
-ExecStart=/usr/bin/python3 -m src.server
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=default.target
-EOF
-
-systemctl --user enable --now disclaude-gate
+tmux new -s work
+claude
 ```
+
+When Claude stops and waits for input, the completion notification includes a **Reply** button that sends your response directly to the terminal.
+
+### Graceful Fallback
+If the server is not running, the hook silently falls through and Claude Code shows its normal terminal prompt.
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────┐
-│ Claude CLI                              │
-│   └─ PreToolUse Hook                    │
-│       └─ hooks/disclaude_gate_hook.py   │
-│           │                             │
-│           │ HTTP POST /approve          │
-│           ▼                             │
-│ src/server.py                           │
-│   ├─ aiohttp (HTTP server, port 19280) │
-│   └─ discord.py (Bot)                  │
-│           │                             │
-│           │ Discord API                 │
-│           ▼                             │
-│ Discord Channel                         │
-│   └─ Embed + Buttons (Allow/Deny/Reply) │
-└─────────────────────────────────────────┘
+┌──────────────────────────────────────────────────┐
+│ Claude CLI                                       │
+│   ├─ PreToolUse Hook → hooks/disclaude_gate_hook.py
+│   └─ Stop Hook       → hooks/disclaude_gate_stop_hook.py
+│          │                                       │
+│          │ HTTP POST                             │
+│          ▼                                       │
+│ src/server.py                                    │
+│   ├─ aiohttp (HTTP server, port 19280)           │
+│   └─ discord.py (Bot)                            │
+│          │                                       │
+│          │ Discord API                           │
+│          ▼                                       │
+│ Discord Channel                                  │
+│   ├─ Thread: "disclaude-gate"                    │
+│   │   ├─ 🔧 Bash [Allow] [Deny] [Reply] [Allow All]
+│   │   └─ ✅ Session finished                     │
+│   └─ Thread: "predict-horse"                     │
+│       ├─ 🤖 researcher › 🔧 Bash                │
+│       └─ ✅ Session finished                     │
+└──────────────────────────────────────────────────┘
 ```
 
 ## License
