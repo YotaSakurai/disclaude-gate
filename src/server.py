@@ -237,16 +237,38 @@ def _extract_last_assistant_message(transcript_path: str) -> str:
 _session_threads: dict[str, discord.Thread] = {}
 
 
+async def _find_existing_thread(
+    channel: discord.TextChannel, thread_name: str,
+) -> discord.Thread | None:
+    """Search for an existing (possibly archived) thread by name."""
+    # Check active threads
+    for thread in channel.threads:
+        if thread.name == thread_name:
+            if thread.archived:
+                await thread.edit(archived=False)
+            return thread
+
+    # Check archived threads
+    async for thread in channel.archived_threads(limit=50):
+        if thread.name == thread_name:
+            await thread.edit(archived=False)
+            return thread
+
+    return None
+
+
 async def _get_or_create_thread(
     channel: discord.TextChannel, session_id: str, session_title: str,
 ) -> discord.Thread:
     """Get an existing thread for the session or create a new one."""
     if session_id in _session_threads:
         thread = _session_threads[session_id]
-        # Check thread is still alive
         try:
             if not thread.archived:
                 return thread
+            # Unarchive if needed
+            await thread.edit(archived=False)
+            return thread
         except Exception:
             pass
 
@@ -255,14 +277,32 @@ async def _get_or_create_thread(
     if len(thread_name) > 100:
         thread_name = thread_name[:97] + "..."
 
+    # Try to reuse existing thread with same name
+    thread = await _find_existing_thread(channel, thread_name)
+    if thread:
+        _session_threads[session_id] = thread
+        log.info("Reusing thread '%s' for session %s", thread_name, session_id[:8])
+        return thread
+
     thread = await channel.create_thread(
         name=thread_name,
         type=discord.ChannelType.public_thread,
-        auto_archive_duration=60,  # archive after 1 hour of inactivity
+        auto_archive_duration=60,
     )
     _session_threads[session_id] = thread
     log.info("Created thread '%s' for session %s", thread_name, session_id[:8])
     return thread
+
+
+async def _archive_thread(session_id: str) -> None:
+    """Archive the thread for a completed session."""
+    thread = _session_threads.pop(session_id, None)
+    if thread:
+        try:
+            await thread.edit(archived=True)
+            log.info("Archived thread for session %s", session_id[:8])
+        except Exception:
+            pass
 
 # ---------------------------------------------------------------------------
 # Pending request store
@@ -584,6 +624,13 @@ async def handle_approval(request: web.Request) -> web.Response:
     # Send to session thread
     thread = await _get_or_create_thread(channel, session_id, session_title)
     await thread.send(embed=embed, view=view)
+
+    # Post brief alert in main channel linking to the thread
+    alert_title = session_title or "Unknown"
+    agent_label = f" ({agent_name})" if agent_name else ""
+    await channel.send(
+        f"\U0001f514 **{alert_title}**{agent_label} needs approval: **{tool_name}** \u2192 {thread.mention}"
+    )
     log.info("Approval request sent to Discord: %s [%s] session=%s", tool_name, request_id[:8], session_title or "?")
 
     # Wait for user response
@@ -656,7 +703,7 @@ async def handle_stop(request: web.Request) -> web.Response:
     # Send to session thread
     thread = await _get_or_create_thread(channel, session_id, session_title)
 
-    # If tmux pane is available, add Reply button
+    # If tmux pane is available, add Reply button (session stays active)
     if tmux_pane:
         view = StopView(tmux_pane)
         await thread.send(embed=embed, view=view)
@@ -664,8 +711,10 @@ async def handle_stop(request: web.Request) -> web.Response:
     else:
         await thread.send(embed=embed)
         log.info("Stop notification sent to Discord: session=%s", session_title or "?")
-        # No tmux = no way to reply, so clean up tracking
+        # No tmux = session is done, clean up and archive
         _sessions_with_approvals.discard(session_id)
+        _auto_allow_sessions.discard(session_id)
+        await _archive_thread(session_id)
 
     return web.json_response({"status": "ok"})
 
