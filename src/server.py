@@ -431,15 +431,12 @@ async def handle_approval(request: web.Request) -> web.Response:
     # Format the tool input for display
     input_display = _format_tool_input(tool_name, tool_input)
 
+    title_prefix = f"[{session_title}] " if session_title else ""
     embed = discord.Embed(
-        title=f"\U0001f527 {tool_name}",
+        title=f"{title_prefix}\U0001f527 {tool_name}",
         description=input_display,
         color=_session_color(session_id),
     )
-
-    # Add session info
-    if session_title:
-        embed.set_author(name=session_title)
 
     # Add recent conversation context
     if recent_context:
@@ -515,14 +512,12 @@ async def handle_stop(request: web.Request) -> web.Response:
         None, _extract_last_assistant_message, transcript_path
     )
 
+    title_prefix = f"[{session_title}] " if session_title else ""
     embed = discord.Embed(
-        title="\u2705 Session finished",
+        title=f"{title_prefix}\u2705 Session finished",
         description=_truncate(last_message, 2000) if last_message else "No output captured.",
         color=_session_color(session_id),
     )
-
-    if session_title:
-        embed.set_author(name=session_title)
 
     if stop_reason:
         embed.add_field(name="Reason", value=stop_reason, inline=True)
