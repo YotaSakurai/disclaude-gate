@@ -168,6 +168,41 @@ def _extract_last_assistant_message(transcript_path: str) -> str:
     return ""
 
 # ---------------------------------------------------------------------------
+# Thread management — one Discord thread per session
+# ---------------------------------------------------------------------------
+
+# session_id -> discord.Thread
+_session_threads: dict[str, discord.Thread] = {}
+
+
+async def _get_or_create_thread(
+    channel: discord.TextChannel, session_id: str, session_title: str,
+) -> discord.Thread:
+    """Get an existing thread for the session or create a new one."""
+    if session_id in _session_threads:
+        thread = _session_threads[session_id]
+        # Check thread is still alive
+        try:
+            if not thread.archived:
+                return thread
+        except Exception:
+            pass
+
+    thread_name = session_title or session_id[:12]
+    # Discord thread name limit is 100 chars
+    if len(thread_name) > 100:
+        thread_name = thread_name[:97] + "..."
+
+    thread = await channel.create_thread(
+        name=thread_name,
+        type=discord.ChannelType.public_thread,
+        auto_archive_duration=60,  # archive after 1 hour of inactivity
+    )
+    _session_threads[session_id] = thread
+    log.info("Created thread '%s' for session %s", thread_name, session_id[:8])
+    return thread
+
+# ---------------------------------------------------------------------------
 # Pending request store
 # ---------------------------------------------------------------------------
 
@@ -454,7 +489,10 @@ async def handle_approval(request: web.Request) -> web.Response:
         view = AskUserQuestionView(request_id, options)
     else:
         view = ApprovalView(request_id)
-    await channel.send(embed=embed, view=view)
+
+    # Send to session thread
+    thread = await _get_or_create_thread(channel, session_id, session_title)
+    await thread.send(embed=embed, view=view)
     log.info("Approval request sent to Discord: %s [%s] session=%s", tool_name, request_id[:8], session_title or "?")
 
     # Wait for user response
@@ -524,13 +562,16 @@ async def handle_stop(request: web.Request) -> web.Response:
     if cwd:
         embed.set_footer(text=Path(cwd).name)
 
+    # Send to session thread
+    thread = await _get_or_create_thread(channel, session_id, session_title)
+
     # If tmux pane is available, add Reply button
     if tmux_pane:
         view = StopView(tmux_pane)
-        await channel.send(embed=embed, view=view)
+        await thread.send(embed=embed, view=view)
         log.info("Stop notification sent to Discord (with reply): session=%s tmux=%s", session_title or "?", tmux_pane)
     else:
-        await channel.send(embed=embed)
+        await thread.send(embed=embed)
         log.info("Stop notification sent to Discord: session=%s", session_title or "?")
         # No tmux = no way to reply, so clean up tracking
         _sessions_with_approvals.discard(session_id)
