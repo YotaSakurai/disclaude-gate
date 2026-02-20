@@ -100,9 +100,18 @@ def _extract_session_context(transcript_path: str, cwd: str) -> tuple[str, str]:
             except Exception:
                 pass
 
-    # Fallback title: use working directory name
+    # Fallback title: find git repo root name, or use a meaningful cwd segment
     if not session_title and cwd:
-        session_title = Path(cwd).name
+        cwd_path = Path(cwd)
+        # Walk up to find .git directory (repo root)
+        for parent in [cwd_path, *cwd_path.parents]:
+            if (parent / ".git").exists():
+                session_title = parent.name
+                break
+            if parent == parent.parent:
+                break
+        if not session_title:
+            session_title = cwd_path.name
 
     # Extract recent user messages from transcript
     if transcript_path and Path(transcript_path).is_file():
