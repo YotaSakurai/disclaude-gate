@@ -254,6 +254,60 @@ class StopView(ui.View):
         await interaction.response.send_modal(StopReplyModal(self.tmux_pane))
 
 
+class AskUserQuestionView(ui.View):
+    """Dynamic buttons for AskUserQuestion options + free-text Reply."""
+
+    def __init__(self, request_id: str, options: list[dict]) -> None:
+        super().__init__(timeout=APPROVAL_TIMEOUT)
+        self.request_id = request_id
+        # Add a button per option (Discord limit: max 25 components, 5 per row)
+        for i, opt in enumerate(options[:20]):
+            label = opt.get("label", f"Option {i + 1}")
+            # Truncate label to Discord's 80-char limit
+            if len(label) > 80:
+                label = label[:77] + "..."
+            button = ui.Button(
+                label=label,
+                style=discord.ButtonStyle.primary,
+                custom_id=f"ask_{request_id[:8]}_{i}",
+            )
+            button.callback = self._make_option_callback(label)
+            self.add_item(button)
+        # Add free-text reply button
+        reply_btn = ui.Button(
+            label="Other",
+            style=discord.ButtonStyle.secondary,
+            emoji="\U0001f4ac",
+            custom_id=f"ask_{request_id[:8]}_reply",
+        )
+        reply_btn.callback = self._reply_callback
+        self.add_item(reply_btn)
+
+    def _make_option_callback(self, label: str):
+        async def callback(interaction: discord.Interaction) -> None:
+            req = _pending.get(self.request_id)
+            if req is None:
+                await interaction.response.send_message("This request has already expired.", ephemeral=True)
+                return
+            req.decision = "deny"
+            req.reason = label
+            req.event.set()
+            embed = discord.Embed(description=f"Selected: {label}", color=discord.Color.blue())
+            await interaction.response.send_message(embed=embed)
+            self.stop()
+        return callback
+
+    async def _reply_callback(self, interaction: discord.Interaction) -> None:
+        await interaction.response.send_modal(ReplyModal(self.request_id))
+
+    async def on_timeout(self) -> None:
+        req = _pending.get(self.request_id)
+        if req and not req.event.is_set():
+            req.decision = "deny"
+            req.reason = "Timed out waiting for response"
+            req.event.set()
+
+
 class ApprovalView(ui.View):
     """Discord buttons: Allow / Deny / Reply."""
 
@@ -381,7 +435,13 @@ async def handle_approval(request: web.Request) -> web.Response:
         footer_parts.append(Path(cwd).name)
     embed.set_footer(text=" | ".join(footer_parts))
 
-    view = ApprovalView(request_id)
+    # Use AskUserQuestion view if applicable
+    if tool_name == "AskUserQuestion":
+        questions = tool_input.get("questions", [])
+        options = questions[0].get("options", []) if questions else []
+        view = AskUserQuestionView(request_id, options)
+    else:
+        view = ApprovalView(request_id)
     await channel.send(embed=embed, view=view)
     log.info("Approval request sent to Discord: %s [%s] session=%s", tool_name, request_id[:8], session_title or "?")
 
@@ -498,6 +558,17 @@ def _format_tool_input(tool_name: str, tool_input: dict) -> str:
 
     if tool_name == "Read" and "file_path" in tool_input:
         return f"**File:** `{tool_input['file_path']}`"
+
+    if tool_name == "AskUserQuestion" and "questions" in tool_input:
+        questions = tool_input["questions"]
+        parts = []
+        for q in questions:
+            parts.append(f"**{q.get('question', '')}**")
+            for i, opt in enumerate(q.get("options", []), 1):
+                label = opt.get("label", "")
+                desc = opt.get("description", "")
+                parts.append(f"{i}. **{label}**" + (f" — {desc}" if desc else ""))
+        return "\n".join(parts)
 
     # Generic fallback
     formatted = json.dumps(tool_input, ensure_ascii=False, indent=2)
