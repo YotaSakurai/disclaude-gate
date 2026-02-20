@@ -282,7 +282,7 @@ async def handle_approval(request: web.Request) -> web.Response:
 
     # Add session info
     if session_title:
-        embed.author = discord.EmbedAuthor(name=session_title)
+        embed.set_author(name=session_title)
 
     # Add recent conversation context
     if recent_context:
