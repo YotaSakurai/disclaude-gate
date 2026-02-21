@@ -396,8 +396,25 @@ class ReplyModal(ui.Modal, title="Reply to Claude"):
 def _tmux_send_keys(tmux_pane: str, text: str) -> bool:
     """Send text to a tmux pane as keyboard input."""
     try:
+        # Use -l (literal) to send text, then Enter separately
         subprocess.run(
-            ["tmux", "send-keys", "-t", tmux_pane, text, "Enter"],
+            ["tmux", "send-keys", "-t", tmux_pane, "-l", text],
+            capture_output=True, timeout=5, check=True,
+        )
+        subprocess.run(
+            ["tmux", "send-keys", "-t", tmux_pane, "Enter"],
+            capture_output=True, timeout=5, check=True,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _tmux_send_enter(tmux_pane: str) -> bool:
+    """Send just Enter key to a tmux pane (for confirming UI selections)."""
+    try:
+        subprocess.run(
+            ["tmux", "send-keys", "-t", tmux_pane, "Enter"],
             capture_output=True, timeout=5, check=True,
         )
         return True
@@ -462,7 +479,11 @@ def _tmux_type_other_option(tmux_pane: str, text: str, num_options: int) -> bool
         )
         time.sleep(0.2)  # Wait for text input prompt
         subprocess.run(
-            ["tmux", "send-keys", "-t", tmux_pane, text, "Enter"],
+            ["tmux", "send-keys", "-t", tmux_pane, "-l", text],
+            capture_output=True, timeout=5, check=True,
+        )
+        subprocess.run(
+            ["tmux", "send-keys", "-t", tmux_pane, "Enter"],
             capture_output=True, timeout=5, check=True,
         )
         return True
@@ -502,23 +523,27 @@ class StopView(ui.View):
         super().__init__(timeout=APPROVAL_TIMEOUT)
         self.tmux_pane = tmux_pane
 
-    async def _send_and_resolve(self, interaction: discord.Interaction, text: str) -> None:
+    async def _send_and_resolve(self, interaction: discord.Interaction, label: str, keys_fn) -> None:
         loop = asyncio.get_running_loop()
-        success = await loop.run_in_executor(None, _tmux_send_keys, self.tmux_pane, text)
+        success = await loop.run_in_executor(None, keys_fn)
         if success:
             await interaction.response.defer()
-            await _mark_resolved(interaction.message, self, "\U0001f4ac", discord.Color.blue(), text)
+            await _mark_resolved(interaction.message, self, "\U0001f4ac", discord.Color.blue(), label)
         else:
             await interaction.response.send_message("Failed to send to tmux pane.", ephemeral=True)
         self.stop()
 
     @ui.button(label="Yes", style=discord.ButtonStyle.success)
     async def yes(self, interaction: discord.Interaction, button: ui.Button) -> None:
-        await self._send_and_resolve(interaction, "yes")
+        # Enter confirms the default (first) option
+        await self._send_and_resolve(interaction, "Yes",
+            lambda: _tmux_send_enter(self.tmux_pane))
 
     @ui.button(label="No", style=discord.ButtonStyle.danger)
     async def no(self, interaction: discord.Interaction, button: ui.Button) -> None:
-        await self._send_and_resolve(interaction, "no")
+        # Navigate down to "No" option, then confirm
+        await self._send_and_resolve(interaction, "No",
+            lambda: _tmux_select_option(self.tmux_pane, 1))
 
     @ui.button(label="Reply", style=discord.ButtonStyle.primary, emoji="\U0001f4ac")
     async def reply(self, interaction: discord.Interaction, button: ui.Button) -> None:
