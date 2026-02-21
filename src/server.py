@@ -1172,13 +1172,18 @@ async def handle_stop(request: web.Request) -> web.Response:
         None, _extract_last_assistant_message, transcript_path
     )
 
+    # Detect if Claude is asking a question (needs interactive response)
+    last_line = last_message.rstrip().rsplit("\n", 1)[-1] if last_message else ""
+    is_question = last_line.rstrip().endswith(("?", "\uff1f"))
+
     title_prefix = f"[{session_title}] " if session_title else ""
-    if tmux_pane:
-        # tmux available — Claude is waiting for input, show reply buttons
+    if is_question and tmux_pane:
         title_icon = "\u2753"  # ❓ Waiting for input
         title_label = "Waiting for input"
+    elif tmux_pane:
+        title_icon = "\u23f8\ufe0f"  # ⏸️ Paused
+        title_label = "Paused"
     else:
-        # No tmux — session finished, informational only
         title_icon = "\u2705"  # ✅ Session finished
         title_label = "Session finished"
     embed = discord.Embed(
@@ -1195,11 +1200,21 @@ async def handle_stop(request: web.Request) -> web.Response:
     # Send to session thread
     thread = await _get_or_create_thread(channel, session_id, session_title)
 
-    if tmux_pane:
-        # Always show Yes/No/Reply buttons when tmux is available
+    if is_question and tmux_pane:
+        # Question detected — show Yes/No/Reply buttons
         view = StopView(tmux_pane)
         await thread.send(embed=embed, view=view)
-        log.info("Stop notification sent (waiting): session=%s tmux=%s", session_title or "?", tmux_pane)
+        log.info("Stop notification sent (question): session=%s tmux=%s", session_title or "?", tmux_pane)
+    elif tmux_pane:
+        # Paused but not a question — Reply button only
+        view = ui.View(timeout=APPROVAL_TIMEOUT)
+        reply_btn = ui.Button(label="Reply", style=discord.ButtonStyle.primary, emoji="\U0001f4ac")
+        async def _reply_cb(interaction: discord.Interaction) -> None:
+            await interaction.response.send_modal(StopReplyModal(tmux_pane))
+        reply_btn.callback = _reply_cb
+        view.add_item(reply_btn)
+        await thread.send(embed=embed, view=view)
+        log.info("Stop notification sent (paused): session=%s tmux=%s", session_title or "?", tmux_pane)
     else:
         await thread.send(embed=embed)
         log.info("Stop notification sent (finished): session=%s", session_title or "?")
