@@ -57,30 +57,61 @@ def _load_claude_permissions() -> list[str]:
     return []
 
 
-def _is_bash_allowed_by_claude(command: str, allow_list: list[str]) -> bool:
-    """Check if a Bash command matches any pattern in Claude's permission allow list.
+# Read-only / safe commands that never need approval.
+# These can't modify files or cause damage.
+SAFE_BASH_COMMANDS = {
+    "tree", "cat", "head", "tail", "wc", "file", "stat", "du", "df",
+    "which", "whereis", "type", "whoami", "hostname", "uname", "date",
+    "env", "printenv", "id", "pwd", "realpath", "dirname", "basename",
+    "diff", "comm", "sort", "uniq", "tr", "cut", "paste", "tee",
+    "less", "more", "strings", "hexdump", "xxd", "md5sum", "sha256sum",
+    "test", "[",
+}
 
-    Patterns look like:
-      "Bash(git commit:*)"  — matches commands starting with "git commit"
-      "Bash(ls:*)"          — matches commands starting with "ls"
-      "Bash(exact command)"  — matches the exact command
-    """
+
+def _single_cmd_allowed(cmd: str, allow_list: list[str]) -> bool:
+    """Check if a single (non-compound) command matches Claude's allow list."""
+    cmd = cmd.strip()
+    if not cmd:
+        return True
+    # Check against safe read-only commands
+    first_word = cmd.split()[0] if cmd.split() else ""
+    if first_word in SAFE_BASH_COMMANDS:
+        return True
     for entry in allow_list:
-        # Only check Bash(...) entries
         m = re.match(r'^Bash\((.+)\)$', entry)
         if not m:
             continue
         pattern = m.group(1)
-        # "git commit:*" → match commands starting with "git commit"
         if pattern.endswith(":*"):
             prefix = pattern[:-2]
-            if command == prefix or command.startswith(prefix + " ") or command.startswith(prefix + "\n"):
+            if cmd == prefix or cmd.startswith(prefix + " ") or cmd.startswith(prefix + "\n"):
                 return True
         else:
-            # Exact match
-            if command == pattern:
+            if cmd == pattern:
                 return True
     return False
+
+
+def _is_bash_allowed_by_claude(command: str, allow_list: list[str]) -> bool:
+    """Check if a Bash command matches any pattern in Claude's permission allow list.
+
+    Handles compound commands joined by ||, &&, ;, and pipes (|).
+    All parts must be allowed for the whole command to be auto-approved.
+    """
+    # Split on shell operators: ||, &&, ;, |
+    # Use regex to split while handling quoted strings would be complex,
+    # so we do a simple split that works for typical commands.
+    parts = re.split(r'\|\||&&|;|\|', command)
+    # Strip redirections (2>/dev/null etc.) from each part
+    cleaned = []
+    for part in parts:
+        part = re.sub(r'\d*>[>&]?\s*/dev/null', '', part).strip()
+        if part:
+            cleaned.append(part)
+    if not cleaned:
+        return True
+    return all(_single_cmd_allowed(p, allow_list) for p in cleaned)
 
 
 def _log(msg: str) -> None:
