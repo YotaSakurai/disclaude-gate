@@ -1130,13 +1130,6 @@ async def handle_stop(request: web.Request) -> web.Response:
     stop_reason: str = body.get("stop_reason", "")
     tmux_pane: str = body.get("tmux_pane", "")
 
-    # Without tmux we can't send responses, so only notify if session had approvals
-    if not tmux_pane:
-        had_approvals = session_id in _sessions_with_approvals
-        if not had_approvals:
-            log.info("Stop ignored (no tmux): session=%s", session_id[:8] if session_id else "?")
-            return web.json_response({"status": "skipped", "reason": "no tmux"})
-
     await _bot_ready.wait()
 
     channel = bot.get_channel(DISCORD_CHANNEL_ID)
