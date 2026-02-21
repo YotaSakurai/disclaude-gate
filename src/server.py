@@ -8,6 +8,7 @@ import logging
 import os
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -354,8 +355,9 @@ async def _mark_resolved(
         item.disabled = True
     try:
         await msg.edit(embed=embed, view=view)
+        log.debug("_mark_resolved: updated message (status=%s)", status)
     except Exception:
-        pass
+        log.exception("_mark_resolved: failed to update message")
 
 
 class ReplyModal(ui.Modal, title="Reply to Claude"):
@@ -394,6 +396,71 @@ class ReplyModal(ui.Modal, title="Reply to Claude"):
 def _tmux_send_keys(tmux_pane: str, text: str) -> bool:
     """Send text to a tmux pane as keyboard input."""
     try:
+        subprocess.run(
+            ["tmux", "send-keys", "-t", tmux_pane, text, "Enter"],
+            capture_output=True, timeout=5, check=True,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _tmux_select_option(tmux_pane: str, option_index: int) -> bool:
+    """Select option at given index in an interactive CLI prompt via tmux arrow keys."""
+    try:
+        for _ in range(option_index):
+            subprocess.run(
+                ["tmux", "send-keys", "-t", tmux_pane, "Down"],
+                capture_output=True, timeout=5, check=True,
+            )
+        subprocess.run(
+            ["tmux", "send-keys", "-t", tmux_pane, "Enter"],
+            capture_output=True, timeout=5, check=True,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _tmux_select_multi_options(tmux_pane: str, option_indices: list[int]) -> bool:
+    """Toggle multiple options in a multi-select prompt and submit via tmux."""
+    try:
+        current_pos = 0
+        for idx in sorted(option_indices):
+            moves = idx - current_pos
+            for _ in range(moves):
+                subprocess.run(
+                    ["tmux", "send-keys", "-t", tmux_pane, "Down"],
+                    capture_output=True, timeout=5, check=True,
+                )
+            subprocess.run(
+                ["tmux", "send-keys", "-t", tmux_pane, "Space"],
+                capture_output=True, timeout=5, check=True,
+            )
+            current_pos = idx
+        subprocess.run(
+            ["tmux", "send-keys", "-t", tmux_pane, "Enter"],
+            capture_output=True, timeout=5, check=True,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _tmux_type_other_option(tmux_pane: str, text: str, num_options: int) -> bool:
+    """Select 'Other' option and type custom text via tmux."""
+    try:
+        # Navigate past all defined options to reach 'Other'
+        for _ in range(num_options):
+            subprocess.run(
+                ["tmux", "send-keys", "-t", tmux_pane, "Down"],
+                capture_output=True, timeout=5, check=True,
+            )
+        subprocess.run(
+            ["tmux", "send-keys", "-t", tmux_pane, "Enter"],
+            capture_output=True, timeout=5, check=True,
+        )
+        time.sleep(0.2)  # Wait for text input prompt
         subprocess.run(
             ["tmux", "send-keys", "-t", tmux_pane, text, "Enter"],
             capture_output=True, timeout=5, check=True,
@@ -600,6 +667,194 @@ class AskUserQuestionView(ui.View):
                 await _mark_resolved(self._original_message, self, "\u23f0", discord.Color.dark_grey())
 
 
+class AskQuestionTmuxReplyModal(ui.Modal, title="Reply to Claude"):
+    """Modal for typing a custom answer that gets injected via tmux."""
+
+    message = ui.TextInput(
+        label="Message",
+        style=discord.TextStyle.paragraph,
+        placeholder="Type your answer...",
+        max_length=1000,
+    )
+
+    def __init__(self, tmux_pane: str, num_options: int,
+                 original_message: discord.Message | None = None,
+                 parent_view: ui.View | None = None) -> None:
+        super().__init__()
+        self.tmux_pane = tmux_pane
+        self.num_options = num_options
+        self.original_message = original_message
+        self.parent_view = parent_view
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        text = str(self.message).strip()
+        loop = asyncio.get_running_loop()
+        success = await loop.run_in_executor(
+            None, _tmux_type_other_option, self.tmux_pane, text, self.num_options
+        )
+        if success:
+            await interaction.response.defer()
+            if self.original_message and self.parent_view:
+                await _mark_resolved(
+                    self.original_message, self.parent_view,
+                    "\U0001f4ac", discord.Color.blue(), text[:200]
+                )
+        else:
+            await interaction.response.send_message("Failed to send to tmux.", ephemeral=True)
+
+
+class AskQuestionTmuxView(ui.View):
+    """AskUserQuestion view that injects answers into the terminal via tmux."""
+
+    def __init__(self, tmux_pane: str, questions: list[dict]) -> None:
+        super().__init__(timeout=APPROVAL_TIMEOUT)
+        self.tmux_pane = tmux_pane
+        self._original_message: discord.Message | None = None
+        self._questions = questions
+
+        if len(questions) <= 1:
+            # Single question — buttons for each option
+            options = questions[0].get("options", []) if questions else []
+            for i, opt in enumerate(options[:20]):
+                label = opt.get("label", f"Option {i + 1}")
+                if len(label) > 80:
+                    label = label[:77] + "..."
+                button = ui.Button(
+                    label=label,
+                    style=discord.ButtonStyle.primary,
+                    custom_id=f"tmux_ask_{id(self)}_{i}",
+                )
+                button.callback = self._make_option_callback(i, label)
+                self.add_item(button)
+        else:
+            # Multi-question — select menus + submit
+            self._answer_indices: dict[int, list[int]] = {}
+            self._answer_labels: dict[int, list[str]] = {}
+            for qi, q in enumerate(questions[:4]):
+                options = q.get("options", [])
+                is_multi = q.get("multiSelect", False)
+                header = q.get("header", f"Q{qi + 1}")
+                select_options = []
+                for oi, opt in enumerate(options[:25]):
+                    label = opt.get("label", f"Option {oi + 1}")
+                    desc = opt.get("description", "")
+                    if len(label) > 100:
+                        label = label[:97] + "..."
+                    if len(desc) > 100:
+                        desc = desc[:97] + "..."
+                    select_options.append(discord.SelectOption(
+                        label=label, description=desc or None, value=str(oi),
+                    ))
+                select = ui.Select(
+                    placeholder=f"{header}: {q.get('question', '')[:90]}",
+                    options=select_options,
+                    min_values=1,
+                    max_values=len(select_options) if is_multi else 1,
+                    custom_id=f"tmux_ask_{id(self)}_q{qi}",
+                )
+                select.callback = self._make_select_callback(qi)
+                self.add_item(select)
+            submit_btn = ui.Button(
+                label="Submit", style=discord.ButtonStyle.success, emoji="\u2705",
+                custom_id=f"tmux_ask_{id(self)}_submit",
+            )
+            submit_btn.callback = self._submit_multi
+            self.add_item(submit_btn)
+
+        # "Other" button for free text
+        other_btn = ui.Button(
+            label="Other", style=discord.ButtonStyle.secondary, emoji="\U0001f4ac",
+            custom_id=f"tmux_ask_{id(self)}_other",
+        )
+        other_btn.callback = self._other_callback
+        self.add_item(other_btn)
+
+    # -- Single question: button callbacks --
+
+    def _make_option_callback(self, index: int, label: str):
+        async def callback(interaction: discord.Interaction) -> None:
+            loop = asyncio.get_running_loop()
+            success = await loop.run_in_executor(
+                None, _tmux_select_option, self.tmux_pane, index
+            )
+            if success:
+                await interaction.response.defer()
+                await _mark_resolved(
+                    interaction.message, self, "\U0001f4ac", discord.Color.blue(), label
+                )
+            else:
+                await interaction.response.send_message("Failed to send to tmux.", ephemeral=True)
+            self.stop()
+        return callback
+
+    # -- Multi-question: select + submit callbacks --
+
+    def _make_select_callback(self, qi: int):
+        async def callback(interaction: discord.Interaction) -> None:
+            values = interaction.data.get("values", [])
+            self._answer_indices[qi] = [int(v) for v in values]
+            options = self._questions[qi].get("options", [])
+            self._answer_labels[qi] = [
+                options[int(v)].get("label", f"Option {int(v)+1}")
+                for v in values if int(v) < len(options)
+            ]
+            await interaction.response.defer()
+        return callback
+
+    async def _submit_multi(self, interaction: discord.Interaction) -> None:
+        if len(self._answer_indices) < len(self._questions):
+            remaining = len(self._questions) - len(self._answer_indices)
+            await interaction.response.send_message(
+                f"Please answer all questions ({remaining} remaining).", ephemeral=True,
+            )
+            return
+
+        loop = asyncio.get_running_loop()
+        for qi in range(len(self._questions)):
+            indices = self._answer_indices.get(qi, [])
+            is_multi = self._questions[qi].get("multiSelect", False)
+            if is_multi:
+                success = await loop.run_in_executor(
+                    None, _tmux_select_multi_options, self.tmux_pane, indices
+                )
+            else:
+                idx = indices[0] if indices else 0
+                success = await loop.run_in_executor(
+                    None, _tmux_select_option, self.tmux_pane, idx
+                )
+            if not success:
+                await interaction.response.send_message("Failed to send to tmux.", ephemeral=True)
+                return
+            # Wait for next question prompt to appear
+            if qi < len(self._questions) - 1:
+                await asyncio.sleep(0.5)
+
+        parts = [f"Q{qi+1}: {', '.join(self._answer_labels.get(qi, []))}"
+                 for qi in range(len(self._questions))]
+        summary = "\n".join(parts)
+        await interaction.response.defer()
+        await _mark_resolved(
+            interaction.message, self, "\U0001f4ac", discord.Color.blue(), summary[:200]
+        )
+        self.stop()
+
+    # -- Other (free text) --
+
+    async def _other_callback(self, interaction: discord.Interaction) -> None:
+        num_options = len(self._questions[0].get("options", [])) if self._questions else 0
+        await interaction.response.send_modal(
+            AskQuestionTmuxReplyModal(
+                self.tmux_pane, num_options, interaction.message, self
+            )
+        )
+
+    async def on_timeout(self) -> None:
+        if self._original_message:
+            await _mark_resolved(
+                self._original_message, self, "\u23f0", discord.Color.dark_grey()
+            )
+
+
 class ApprovalView(ui.View):
     """Discord buttons: Allow / Deny / Reply / Allow All."""
 
@@ -654,8 +909,12 @@ class ApprovalView(ui.View):
         if req is None:
             await interaction.response.send_message("This request has already expired.", ephemeral=True)
             return
+        log.info("Allow All tapped: session_id=%r, request_id=%s", self.session_id, self.request_id[:8])
         if self.session_id:
             _auto_allow_sessions.add(self.session_id)
+            log.info("Session added to auto-allow: %s", self.session_id[:8])
+        else:
+            log.warning("Allow All: session_id is empty — auto-approve will NOT work")
         req.decision = "allow"
         req.event.set()
         await interaction.response.defer()
@@ -680,6 +939,60 @@ async def on_ready() -> None:
 # ---------------------------------------------------------------------------
 # HTTP API (called by the hook script)
 # ---------------------------------------------------------------------------
+
+async def _ask_question_via_tmux(
+    session_id: str, tool_name: str, tool_input: dict,
+    transcript_path: str, cwd: str, tmux_pane: str,
+) -> None:
+    """Handle AskUserQuestion by sending Discord notification and injecting via tmux."""
+    try:
+        await _bot_ready.wait()
+
+        channel = bot.get_channel(DISCORD_CHANNEL_ID)
+        if channel is None:
+            channel = await bot.fetch_channel(DISCORD_CHANNEL_ID)
+        if channel is None:
+            log.error("AskUserQuestion tmux: Discord channel not found")
+            return
+
+        loop = asyncio.get_running_loop()
+        session_title, recent_context = await loop.run_in_executor(
+            None, _extract_session_context, transcript_path, cwd
+        )
+        agent_name = await loop.run_in_executor(
+            None, _extract_agent_name, transcript_path, tmux_pane
+        )
+
+        questions = tool_input.get("questions", [])
+        input_display = _format_tool_input(tool_name, tool_input)
+
+        title_prefix = f"[{session_title}] " if session_title else ""
+        agent_prefix = f"\U0001f916 {agent_name} \u203a " if agent_name else ""
+        embed = discord.Embed(
+            title=f"{title_prefix}{agent_prefix}\u2753 Question",
+            description=input_display,
+            color=_session_color(session_id),
+        )
+        if recent_context:
+            embed.add_field(name="Recent conversation", value=_truncate(recent_context, 1000), inline=False)
+        embed.set_footer(text=f"Timeout: {APPROVAL_TIMEOUT}s | tmux: {tmux_pane}")
+
+        view = AskQuestionTmuxView(tmux_pane, questions)
+
+        thread = await _get_or_create_thread(channel, session_id, session_title)
+        sent_msg = await thread.send(embed=embed, view=view)
+        view._original_message = sent_msg
+
+        alert_title = session_title or "Unknown"
+        agent_label = f" ({agent_name})" if agent_name else ""
+        await channel.send(
+            f"\U0001f514 **{alert_title}**{agent_label} asks: \u2753 Question \u2192 {thread.mention}"
+        )
+        log.info("AskUserQuestion sent to Discord (tmux mode): session=%s", session_title or "?")
+
+    except Exception:
+        log.exception("Failed to handle AskUserQuestion via tmux")
+
 
 async def handle_approval(request: web.Request) -> web.Response:
     """Receive a tool approval request from the hook script."""
@@ -708,6 +1021,17 @@ async def handle_approval(request: web.Request) -> web.Response:
         log.info("Auto-approved (Allow All): %s [%s]", tool_name, session_id[:8])
         return web.json_response({"decision": "allow"})
 
+    # AskUserQuestion + tmux: allow immediately, inject answer via tmux in background
+    tmux_pane: str = body.get("tmux_pane", "")
+    if tool_name == "AskUserQuestion" and tmux_pane:
+        asyncio.create_task(_ask_question_via_tmux(
+            session_id, tool_name, tool_input,
+            transcript_path, cwd, tmux_pane,
+        ))
+        log.info("AskUserQuestion: allow + tmux inject (pane=%s, session=%s)",
+                 tmux_pane, session_id[:8] if session_id else "?")
+        return web.json_response({"decision": "allow"})
+
     # Create pending request
     req = PendingRequest(request_id=request_id, tool_name=tool_name, tool_input=tool_input)
     _pending[request_id] = req
@@ -729,7 +1053,6 @@ async def handle_approval(request: web.Request) -> web.Response:
     session_title, recent_context = await loop.run_in_executor(
         None, _extract_session_context, transcript_path, cwd
     )
-    tmux_pane: str = body.get("tmux_pane", "")
     agent_name = await loop.run_in_executor(
         None, _extract_agent_name, transcript_path, tmux_pane
     )
@@ -867,18 +1190,19 @@ async def handle_stop(request: web.Request) -> web.Response:
     # Send to session thread
     thread = await _get_or_create_thread(channel, session_id, session_title)
 
-    # If tmux pane is available, add Reply button (session stays active)
-    if tmux_pane:
+    # Only show Yes/No/Reply buttons when Claude is asking a question
+    if is_question and tmux_pane:
         view = StopView(tmux_pane)
         await thread.send(embed=embed, view=view)
-        log.info("Stop notification sent to Discord (with reply): session=%s tmux=%s", session_title or "?", tmux_pane)
+        log.info("Stop notification sent (question): session=%s tmux=%s", session_title or "?", tmux_pane)
     else:
         await thread.send(embed=embed)
-        log.info("Stop notification sent to Discord: session=%s", session_title or "?")
-        # No tmux = session is done, clean up and archive
-        _sessions_with_approvals.discard(session_id)
-        _auto_allow_sessions.discard(session_id)
-        await _archive_thread(session_id)
+        log.info("Stop notification sent (finished): session=%s", session_title or "?")
+        if not tmux_pane:
+            # No tmux = session is done, clean up and archive
+            _sessions_with_approvals.discard(session_id)
+            _auto_allow_sessions.discard(session_id)
+            await _archive_thread(session_id)
 
     return web.json_response({"status": "ok"})
 
