@@ -108,10 +108,8 @@ def _is_bash_allowed_by_claude(command: str, allow_list: list[str]) -> bool:
     Handles compound commands joined by ||, &&, ;, and pipes (|).
     All parts must be allowed for the whole command to be auto-approved.
     """
-    # Split on shell operators: ||, &&, ;, |
-    # Use regex to split while handling quoted strings would be complex,
-    # so we do a simple split that works for typical commands.
-    parts = re.split(r'\|\||&&|;|\|', command)
+    # Split on shell operators: ||, &&, ;, |, and newlines
+    parts = re.split(r'\|\||&&|;|\||\n', command)
     # Strip redirections (2>/dev/null etc.) from each part
     cleaned = []
     for part in parts:
@@ -150,9 +148,11 @@ def main() -> None:
 
     _log(f"START tool={tool_name} session={session_id} mode={permission_mode}")
 
-    # Auto-allow safe tools
+    # Auto-allow safe tools — explicitly output allow to bypass Claude Code's
+    # own permission prompts (e.g. newline warnings for Bash commands).
     if tool_name in AUTO_ALLOW_TOOLS:
         _log(f"AUTO_ALLOW tool={tool_name}")
+        print(json.dumps({"decision": "allow"}))
         return
 
     # Auto-allow Bash commands that Claude Code already permits
@@ -161,6 +161,7 @@ def main() -> None:
         allow_list = _load_claude_permissions()
         if _is_bash_allowed_by_claude(command, allow_list):
             _log(f"AUTO_ALLOW_BASH command={command[:80]}")
+            print(json.dumps({"decision": "allow"}))
             return
 
     # AskUserQuestion without tmux: can't inject answer remotely,
