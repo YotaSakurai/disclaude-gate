@@ -60,11 +60,20 @@ def _load_claude_permissions() -> list[str]:
 # Read-only / safe commands that never need approval.
 # These can't modify files or cause damage.
 SAFE_BASH_COMMANDS = {
-    "tree", "cat", "head", "tail", "wc", "file", "stat", "du", "df",
+    # Navigation & info
+    "cd", "ls", "pwd", "tree", "file", "stat", "du", "df",
     "which", "whereis", "type", "whoami", "hostname", "uname", "date",
-    "env", "printenv", "id", "pwd", "realpath", "dirname", "basename",
+    "id", "realpath", "dirname", "basename",
+    # Reading & text processing
+    "cat", "head", "tail", "wc", "less", "more",
     "diff", "comm", "sort", "uniq", "tr", "cut", "paste", "tee",
-    "less", "more", "strings", "hexdump", "xxd", "md5sum", "sha256sum",
+    "strings", "hexdump", "xxd", "md5sum", "sha256sum",
+    # Environment
+    "env", "printenv", "echo", "printf",
+    # Build & dev tools (read-only operations)
+    "npm", "npx", "node", "python", "python3",
+    "pip", "pip3", "uv",
+    # Test
     "test", "[",
 }
 
