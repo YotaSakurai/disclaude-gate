@@ -1130,23 +1130,12 @@ async def handle_stop(request: web.Request) -> web.Response:
     stop_reason: str = body.get("stop_reason", "")
     tmux_pane: str = body.get("tmux_pane", "")
 
-    had_approvals = session_id in _sessions_with_approvals
-
-    # For sessions without prior approvals, only notify if Claude's last
-    # output looks like a question (waiting for user input) AND tmux is available
-    if not had_approvals:
-        if not tmux_pane:
-            log.info("Stop ignored (no approvals, no tmux): session=%s", session_id[:8] if session_id else "?")
-            return web.json_response({"status": "skipped", "reason": "no approvals in session"})
-        # Check if Claude is asking a question
-        loop = asyncio.get_running_loop()
-        last_msg = await loop.run_in_executor(
-            None, _extract_last_assistant_message, transcript_path
-        )
-        last_line = last_msg.rstrip().rsplit("\n", 1)[-1] if last_msg else ""
-        if not last_line.rstrip().endswith(("?", "\uff1f")):
-            log.info("Stop ignored (no approvals, not a question): session=%s", session_id[:8] if session_id else "?")
-            return web.json_response({"status": "skipped", "reason": "no question detected"})
+    # Without tmux we can't send responses, so only notify if session had approvals
+    if not tmux_pane:
+        had_approvals = session_id in _sessions_with_approvals
+        if not had_approvals:
+            log.info("Stop ignored (no tmux): session=%s", session_id[:8] if session_id else "?")
+            return web.json_response({"status": "skipped", "reason": "no tmux"})
 
     await _bot_ready.wait()
 
@@ -1165,15 +1154,13 @@ async def handle_stop(request: web.Request) -> web.Response:
         None, _extract_last_assistant_message, transcript_path
     )
 
-    # Distinguish "question waiting" from "session done"
-    last_line = last_message.rstrip().rsplit("\n", 1)[-1] if last_message else ""
-    is_question = last_line.rstrip().endswith(("?", "\uff1f"))
-
     title_prefix = f"[{session_title}] " if session_title else ""
-    if is_question and tmux_pane:
+    if tmux_pane:
+        # tmux available — Claude is waiting for input, show reply buttons
         title_icon = "\u2753"  # ❓ Waiting for input
         title_label = "Waiting for input"
     else:
+        # No tmux — session finished, informational only
         title_icon = "\u2705"  # ✅ Session finished
         title_label = "Session finished"
     embed = discord.Embed(
@@ -1190,19 +1177,17 @@ async def handle_stop(request: web.Request) -> web.Response:
     # Send to session thread
     thread = await _get_or_create_thread(channel, session_id, session_title)
 
-    # Only show Yes/No/Reply buttons when Claude is asking a question
-    if is_question and tmux_pane:
+    if tmux_pane:
+        # Always show Yes/No/Reply buttons when tmux is available
         view = StopView(tmux_pane)
         await thread.send(embed=embed, view=view)
-        log.info("Stop notification sent (question): session=%s tmux=%s", session_title or "?", tmux_pane)
+        log.info("Stop notification sent (waiting): session=%s tmux=%s", session_title or "?", tmux_pane)
     else:
         await thread.send(embed=embed)
         log.info("Stop notification sent (finished): session=%s", session_title or "?")
-        if not tmux_pane:
-            # No tmux = session is done, clean up and archive
-            _sessions_with_approvals.discard(session_id)
-            _auto_allow_sessions.discard(session_id)
-            await _archive_thread(session_id)
+        _sessions_with_approvals.discard(session_id)
+        _auto_allow_sessions.discard(session_id)
+        await _archive_thread(session_id)
 
     return web.json_response({"status": "ok"})
 
