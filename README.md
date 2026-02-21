@@ -23,32 +23,47 @@ Claude CLI (WSL/Linux/macOS)          Discord (Phone)
 
 ## Features
 
-- **Allow / Deny / Reply** — approve, reject, or send custom instructions from your phone
-- **Allow All** — auto-approve all remaining requests in a session (great for Agent Teams)
+- **Auto-allow all operations** — Bash, Edit, Write, etc. are auto-approved without notification
 - **AskUserQuestion support** — multiple-choice questions shown as tappable Discord buttons
+- **Stop notifications** — get notified when Claude finishes or asks a question
+  - Question detected (ends with `？`): **Yes / No / Reply** buttons
+  - Paused (no question): **Reply** button only
+  - Session finished (no tmux): informational notification
 - **Session threads** — each Claude session gets its own Discord thread for clean separation
 - **Session colors** — each session has a unique embed color for visual distinction
 - **Agent Teams support** — shows which agent role (researcher, tester, etc.) is requesting
-- **Completion notifications** — get notified when a session finishes, with the last output
-- **tmux reply** — reply to Claude's questions from Discord when running in tmux
+- **tmux integration** — reply to Claude's questions from Discord via tmux key injection
 - **Graceful fallback** — if the server is down, Claude Code falls back to its normal terminal prompt
-- **Auto-allow list** — read-only tools (Read, Glob, Grep, etc.) skip Discord entirely
 
 ## How It Works
 
-1. Claude Code fires a **PreToolUse hook** before executing any tool (Bash, Edit, Write, etc.)
-2. The hook script sends the tool details to a **local HTTP server**
-3. The server creates a **Discord thread** for the session and posts an embed with interactive buttons
+1. **PreToolUse hook** — auto-allows all tool calls (`{"decision": "allow"}`), except `AskUserQuestion` which is forwarded to Discord
+2. **Stop hook** — fires when Claude's turn ends, sends a Discord notification with the last output
+3. Notifications are sent to a **Discord thread** per session with interactive buttons
 4. You tap a button or type a reply on your phone
-5. The decision is returned to Claude Code, which proceeds accordingly
+5. The response is injected into the terminal via **tmux send-keys**
 
-**Key difference from full-remote solutions:** disclaude-gate only notifies you when approval is needed. Your normal CLI workflow stays untouched.
+### Notification Flow
+
+```
+Tool call (Bash, Edit, Write, etc.)
+  → Hook auto-allows → Claude proceeds (no notification)
+
+AskUserQuestion
+  → Discord notification with option buttons → user selects → injected via tmux
+
+Claude stops (turn ends)
+  → Last message ends with ？ → Discord: ❓ Yes/No/Reply buttons
+  → Otherwise                → Discord: ⏸️ Reply button only
+  → No tmux                  → Discord: ✅ informational only
+```
 
 ## Prerequisites
 
 - Python 3.10+
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) installed
 - A Discord account and server
+- **tmux** (recommended — required for remote reply from Discord)
 
 ## Setup
 
@@ -124,7 +139,30 @@ Add to `~/.claude/settings.json`:
 
 Or run `./install.sh` to set this up automatically.
 
-### 5. Run
+### 5. tmux Setup (recommended)
+
+disclaude-gate can inject responses into Claude's terminal via tmux. Add to `~/.bashrc`:
+
+```bash
+# Auto-start tmux on interactive terminal
+if [ -z "$TMUX" ] && [ -n "$PS1" ] && command -v tmux &>/dev/null; then
+    exec tmux new-session
+fi
+```
+
+This ensures every terminal tab runs inside tmux, enabling Discord-to-terminal reply.
+
+### 6. CLAUDE.md Rule (recommended)
+
+Add to your global `~/CLAUDE.md`:
+
+```markdown
+- ユーザーの判断や返答が必要な場合、メッセージの最後を必ず「？」で終えてください（Discord経由の通知検出に使われます）
+```
+
+This ensures Claude always ends with `？` when it needs user input, making question detection reliable.
+
+### 7. Run
 
 ```bash
 # Start the server
@@ -173,51 +211,24 @@ Check status: `systemctl --user status disclaude-gate`
 | `APPROVAL_TIMEOUT` | `300` | Seconds to wait before auto-deny |
 | `PORT` | `19280` | Local HTTP server port |
 
-### Auto-Allow List
-
-By default, read-only tools are auto-allowed without sending a Discord notification. Edit `AUTO_ALLOW_TOOLS` in `hooks/disclaude_gate_hook.py` to customize:
-
-```python
-AUTO_ALLOW_TOOLS = {
-    "Read",
-    "Glob",
-    "Grep",
-    "WebSearch",
-    "WebFetch",
-    "TaskList",
-    "TaskGet",
-}
-```
-
 ## Usage
-
-### Allow / Deny / Reply
-Tap **Allow** or **Deny**. Tap **Reply** to type a custom message — Claude reads it and adjusts its approach.
-
-### Allow All
-Tap **Allow All** to auto-approve all remaining requests in that session. Useful when running Agent Teams with many parallel agents.
 
 ### AskUserQuestion
 When Claude asks a multiple-choice question, each option appears as a tappable button. Tap **Other** for free-text input.
+
+### Stop Notifications
+
+| Claude's last message | Title | Buttons |
+|---|---|---|
+| Ends with `？` or `?` | ❓ Waiting for input | Yes / No / Reply |
+| Anything else (tmux) | ⏸️ Paused | Reply |
+| No tmux available | ✅ Session finished | None |
 
 ### Session Threads
 Each Claude session automatically gets its own Discord thread, keeping conversations organized. Threads are named after the session and auto-archive after 1 hour of inactivity.
 
 ### Agent Teams
 When using Claude Code's Agent Teams feature, the agent's role name is displayed in the notification title (e.g. `🤖 researcher › 🔧 Bash`), so you know which team member is requesting approval.
-
-### Completion Notifications
-When a session that went through approval finishes, you get a notification with Claude's last output — no need to keep checking the terminal.
-
-### tmux Reply (optional)
-Run Claude in tmux to enable replying to Claude's questions from Discord:
-
-```bash
-tmux new -s work
-claude
-```
-
-When Claude stops and waits for input, the completion notification includes a **Reply** button that sends your response directly to the terminal.
 
 ### Graceful Fallback
 If the server is not running, the hook silently falls through and Claude Code shows its normal terminal prompt.
@@ -228,6 +239,7 @@ If the server is not running, the hook silently falls through and Claude Code sh
 ┌──────────────────────────────────────────────────┐
 │ Claude CLI                                       │
 │   ├─ PreToolUse Hook → hooks/disclaude_gate_hook.py
+│   │   └─ Auto-allows all tools (except AskUserQuestion)
 │   └─ Stop Hook       → hooks/disclaude_gate_stop_hook.py
 │          │                                       │
 │          │ HTTP POST                             │
@@ -239,11 +251,11 @@ If the server is not running, the hook silently falls through and Claude Code sh
 │          │ Discord API                           │
 │          ▼                                       │
 │ Discord Channel                                  │
-│   ├─ Thread: "disclaude-gate"                    │
-│   │   ├─ 🔧 Bash [Allow] [Deny] [Reply] [Allow All]
-│   │   └─ ✅ Session finished                     │
-│   └─ Thread: "predict-horse"                     │
-│       ├─ 🤖 researcher › 🔧 Bash                │
+│   ├─ Thread: "my-project"                        │
+│   │   ├─ ❓ Waiting for input [Yes] [No] [Reply] │
+│   │   └─ ⏸️ Paused [Reply]                       │
+│   └─ Thread: "agent-team"                        │
+│       ├─ 🤖 researcher › ❓ Question             │
 │       └─ ✅ Session finished                     │
 └──────────────────────────────────────────────────┘
 ```
