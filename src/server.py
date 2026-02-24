@@ -430,6 +430,8 @@ def _tmux_select_option(tmux_pane: str, option_index: int) -> bool:
                 ["tmux", "send-keys", "-t", tmux_pane, "Down"],
                 capture_output=True, timeout=5, check=True,
             )
+            time.sleep(0.05)
+        time.sleep(0.1)
         subprocess.run(
             ["tmux", "send-keys", "-t", tmux_pane, "Enter"],
             capture_output=True, timeout=5, check=True,
@@ -450,11 +452,14 @@ def _tmux_select_multi_options(tmux_pane: str, option_indices: list[int]) -> boo
                     ["tmux", "send-keys", "-t", tmux_pane, "Down"],
                     capture_output=True, timeout=5, check=True,
                 )
+                time.sleep(0.05)
             subprocess.run(
                 ["tmux", "send-keys", "-t", tmux_pane, "Space"],
                 capture_output=True, timeout=5, check=True,
             )
+            time.sleep(0.05)
             current_pos = idx
+        time.sleep(0.1)
         subprocess.run(
             ["tmux", "send-keys", "-t", tmux_pane, "Enter"],
             capture_output=True, timeout=5, check=True,
@@ -835,6 +840,8 @@ class AskQuestionTmuxView(ui.View):
             return
 
         loop = asyncio.get_running_loop()
+        # Small delay to ensure terminal UI is ready
+        await asyncio.sleep(0.3)
         for qi in range(len(self._questions)):
             indices = self._answer_indices.get(qi, [])
             is_multi = self._questions[qi].get("multiSelect", False)
@@ -850,9 +857,9 @@ class AskQuestionTmuxView(ui.View):
             if not success:
                 await interaction.response.send_message("Failed to send to tmux.", ephemeral=True)
                 return
-            # Wait for next question prompt to appear
+            # Wait for Claude Code to render the next question
             if qi < len(self._questions) - 1:
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(1.5)
 
         parts = [f"Q{qi+1}: {', '.join(self._answer_labels.get(qi, []))}"
                  for qi in range(len(self._questions))]
