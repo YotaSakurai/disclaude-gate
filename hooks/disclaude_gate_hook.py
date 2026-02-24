@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""Claude Code PreToolUse hook — auto-allows all operations except AskUserQuestion.
+"""Claude Code PreToolUse hook — auto-allows all operations except AskUserQuestion
+and destructive Bash commands.
 
 AskUserQuestion is forwarded to disclaude-gate so the user can answer from Discord.
+Destructive Bash commands (rm, rmdir, etc.) are forwarded for Discord approval.
 Everything else (Bash, Edit, Write, etc.) is auto-approved without notification.
 """
 
@@ -9,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import urllib.error
@@ -17,6 +20,22 @@ import uuid
 
 SERVER_URL = "http://127.0.0.1:19280"
 DEBUG_LOG = "/tmp/disclaude-hook-debug.log"
+
+# Commands that delete or destroy data — require Discord approval
+DESTRUCTIVE_COMMANDS = {
+    "rm", "rmdir", "shred", "unlink",
+}
+
+# Destructive git subcommands / flag patterns
+DESTRUCTIVE_GIT_PATTERNS = [
+    r"\bgit\s+clean\b",
+    r"\bgit\s+reset\s+--hard\b",
+    r"\bgit\s+push\s+.*--force\b",
+    r"\bgit\s+push\s+.*-f\b",
+    r"\bgit\s+branch\s+.*-[dD]\b",
+    r"\bgit\s+checkout\s+--\s",       # git checkout -- <file> (discard changes)
+    r"\bgit\s+restore\s+(?!--staged)", # git restore <file> (discard changes, but not --staged)
+]
 
 
 def _log(msg: str) -> None:
@@ -27,6 +46,40 @@ def _log(msg: str) -> None:
             f.write(f"{datetime.datetime.now():%H:%M:%S} {msg}\n")
     except Exception:
         pass
+
+
+def _is_destructive_bash(command: str) -> bool:
+    """Check if a Bash command contains destructive operations."""
+    # Split compound commands on ||, &&, ;, |, newlines
+    parts = re.split(r'\|\||&&|;|\||\n', command)
+    for part in parts:
+        stripped = part.strip()
+        if not stripped:
+            continue
+        # Extract the first word (the command name), skipping env vars and sudo
+        tokens = stripped.split()
+        idx = 0
+        while idx < len(tokens):
+            tok = tokens[idx]
+            # Skip variable assignments (FOO=bar)
+            if "=" in tok and not tok.startswith("-"):
+                idx += 1
+                continue
+            # Skip sudo
+            if tok == "sudo":
+                idx += 1
+                continue
+            break
+        if idx >= len(tokens):
+            continue
+        base_cmd = os.path.basename(tokens[idx])
+        if base_cmd in DESTRUCTIVE_COMMANDS:
+            return True
+    # Check full command against destructive git patterns
+    for pattern in DESTRUCTIVE_GIT_PATTERNS:
+        if re.search(pattern, command):
+            return True
+    return False
 
 
 def main() -> None:
@@ -44,8 +97,18 @@ def main() -> None:
 
     _log(f"START tool={tool_name} session={session_id}")
 
-    # Only AskUserQuestion needs Discord interaction — everything else is auto-allowed.
-    if tool_name != "AskUserQuestion":
+    # Check if this is a destructive Bash command that needs Discord approval
+    needs_discord = False
+    if tool_name == "AskUserQuestion":
+        needs_discord = True
+    elif tool_name == "Bash":
+        command = tool_input.get("command", "")
+        if _is_destructive_bash(command):
+            _log(f"DESTRUCTIVE_BASH: {command}")
+            needs_discord = True
+
+    # Non-destructive operations are auto-allowed
+    if not needs_discord:
         _log(f"AUTO_ALLOW tool={tool_name}")
         print(json.dumps({"decision": "allow"}))
         return
