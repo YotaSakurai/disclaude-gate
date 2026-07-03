@@ -332,6 +332,9 @@ _sessions_with_approvals: set[str] = set()
 # Sessions where user has chosen "Allow All" — auto-approve everything
 _auto_allow_sessions: set[str] = set()
 
+# Global auto-approve toggle (controlled via !autoyes Discord command)
+_auto_approve_all: bool = False
+
 # ---------------------------------------------------------------------------
 # Discord UI components
 # ---------------------------------------------------------------------------
@@ -958,6 +961,7 @@ class ApprovalView(ui.View):
 # ---------------------------------------------------------------------------
 
 intents = discord.Intents.default()
+intents.message_content = True
 bot = discord.Client(intents=intents)
 
 _bot_ready = asyncio.Event()
@@ -967,6 +971,31 @@ _bot_ready = asyncio.Event()
 async def on_ready() -> None:
     log.info("Discord bot connected as %s", bot.user)
     _bot_ready.set()
+
+
+@bot.event
+async def on_message(message: discord.Message) -> None:
+    if message.author.bot:
+        return
+    content = message.content.strip().lower()
+    if content == "!autoyes":
+        global _auto_approve_all
+        _auto_approve_all = not _auto_approve_all
+        if _auto_approve_all:
+            embed = discord.Embed(
+                title="\U0001f7e2 Auto Yes: ON",
+                description="All approval requests and stop-questions will be auto-approved.\nAskUserQuestion (option selection) is excluded.",
+                color=discord.Color.green(),
+            )
+        else:
+            embed = discord.Embed(
+                title="\U0001f534 Auto Yes: OFF",
+                description="Manual approval mode restored.",
+                color=discord.Color.red(),
+            )
+        await message.channel.send(embed=embed)
+        log.info("Auto Yes toggled: %s", "ON" if _auto_approve_all else "OFF")
+
 
 # ---------------------------------------------------------------------------
 # HTTP API (called by the hook script)
@@ -1026,6 +1055,49 @@ async def _ask_question_via_tmux(
         log.exception("Failed to handle AskUserQuestion via tmux")
 
 
+async def _send_auto_approved_notification(
+    session_id: str, tool_name: str, tool_input: dict,
+    transcript_path: str, cwd: str, tmux_pane: str,
+) -> None:
+    """Send a notification-only embed for auto-approved requests."""
+    try:
+        await _bot_ready.wait()
+        channel = bot.get_channel(DISCORD_CHANNEL_ID)
+        if channel is None:
+            channel = await bot.fetch_channel(DISCORD_CHANNEL_ID)
+        if channel is None:
+            return
+
+        loop = asyncio.get_running_loop()
+        session_title, recent_context = await loop.run_in_executor(
+            None, _extract_session_context, transcript_path, cwd
+        )
+        agent_name = await loop.run_in_executor(
+            None, _extract_agent_name, transcript_path, tmux_pane
+        )
+
+        input_display = _format_tool_input(tool_name, tool_input)
+        title_prefix = f"[{session_title}] " if session_title else ""
+        agent_prefix = f"\U0001f916 {agent_name} \u203a " if agent_name else ""
+        embed = discord.Embed(
+            title=f"\u2705 {title_prefix}{agent_prefix}\U0001f527 {tool_name}",
+            description=input_display,
+            color=discord.Color.green(),
+        )
+        if recent_context:
+            embed.add_field(name="Recent conversation", value=_truncate(recent_context, 1000), inline=False)
+        footer_parts = ["\U0001f916 Auto-approved"]
+        if cwd:
+            footer_parts.append(Path(cwd).name)
+        embed.set_footer(text=" | ".join(footer_parts))
+
+        thread = await _get_or_create_thread(channel, session_id, session_title)
+        await thread.send(embed=embed)
+        log.info("Auto-approved notification: %s session=%s", tool_name, session_title or "?")
+    except Exception:
+        log.exception("Failed to send auto-approved notification")
+
+
 async def handle_approval(request: web.Request) -> web.Response:
     """Receive a tool approval request from the hook script."""
     try:
@@ -1055,6 +1127,16 @@ async def handle_approval(request: web.Request) -> web.Response:
 
     # AskUserQuestion + tmux: allow immediately, inject answer via tmux in background
     tmux_pane: str = body.get("tmux_pane", "")
+
+    # Global auto-approve (AskUserQuestion excluded — needs specific option selection)
+    if _auto_approve_all and tool_name != "AskUserQuestion":
+        log.info("Auto-approved (Auto Yes): %s [session=%s]", tool_name, session_id[:8] if session_id else "?")
+        asyncio.create_task(_send_auto_approved_notification(
+            session_id, tool_name, tool_input,
+            transcript_path, cwd, tmux_pane,
+        ))
+        return web.json_response({"decision": "allow"})
+
     if tool_name == "AskUserQuestion" and tmux_pane:
         asyncio.create_task(_ask_question_via_tmux(
             session_id, tool_name, tool_input,
@@ -1207,7 +1289,19 @@ async def handle_stop(request: web.Request) -> web.Response:
     # Send to session thread
     thread = await _get_or_create_thread(channel, session_id, session_title)
 
-    if is_question and tmux_pane:
+    if is_question and tmux_pane and _auto_approve_all:
+        # Auto-approve: send notification and auto-press Yes
+        embed.title = f"\U0001f916 {embed.title}"
+        footer_parts = ["\U0001f916 Auto: Yes"]
+        if cwd:
+            footer_parts.append(Path(cwd).name)
+        embed.set_footer(text=" | ".join(footer_parts))
+        embed.color = discord.Color.green()
+        await thread.send(embed=embed)
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, _tmux_send_enter, tmux_pane)
+        log.info("Auto-approved stop question: session=%s tmux=%s", session_title or "?", tmux_pane)
+    elif is_question and tmux_pane:
         # Question detected — show Yes/No/Reply buttons
         view = StopView(tmux_pane)
         await thread.send(embed=embed, view=view)

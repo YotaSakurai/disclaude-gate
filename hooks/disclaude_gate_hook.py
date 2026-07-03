@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""Claude Code PreToolUse hook — auto-allows all operations except AskUserQuestion
-and unrecoverable destructive Bash commands.
+"""Claude Code PreToolUse hook — forwards Bash and AskUserQuestion to Discord.
 
-AskUserQuestion is forwarded to disclaude-gate so the user can answer from Discord.
-Destructive Bash commands (rm, rmdir, etc.) are forwarded for Discord approval ONLY
-when the targets are NOT tracked by git (i.e. not recoverable from git history).
-Everything else is auto-approved without notification.
+Read-only Bash commands (ls, cat, grep, git log, etc.) are auto-approved.
+Write/unknown Bash commands and AskUserQuestion are forwarded to disclaude-gate
+for Discord approval. Other tools (Read, Write, Edit, Glob, Grep, etc.)
+are auto-approved without notification.
 """
 
 from __future__ import annotations
@@ -22,6 +21,74 @@ import uuid
 
 SERVER_URL = "http://127.0.0.1:19280"
 DEBUG_LOG = "/tmp/disclaude-hook-debug.log"
+
+# Read-only / informational commands that are safe to auto-approve
+READONLY_COMMANDS = {
+    # File reading
+    "cat", "head", "tail", "less", "more", "bat", "tac",
+    # File listing / info
+    "ls", "ll", "la", "dir", "tree", "stat", "file", "readlink", "realpath",
+    # Searching
+    "find", "grep", "rg", "ag", "ack", "fgrep", "egrep", "fd",
+    # Text processing (read-only)
+    "wc", "sort", "uniq", "cut", "tr", "awk", "sed", "diff", "comm",
+    "column", "paste", "fold", "fmt", "rev", "tee",
+    # System info
+    "echo", "printf", "date", "whoami", "hostname", "uname", "uptime",
+    "env", "printenv", "id", "groups", "locale",
+    # Process / resource info
+    "ps", "top", "htop", "free", "df", "du", "lsof", "ss", "netstat",
+    "pgrep", "pidof", "nproc", "lscpu", "lsmem",
+    # VCS (subcommand-checked separately)
+    "git", "gh",
+    # Package managers (subcommand-checked separately)
+    "npm", "npx", "yarn", "pnpm", "bun",
+    "pip", "pip3", "pipx", "uv",
+    "cargo", "rustup",
+    "go",
+    # Misc read-only
+    "which", "whereis", "type", "command", "hash",
+    "test", "[", "true", "false",
+    "basename", "dirname", "pwd", "sha256sum", "sha1sum", "md5sum",
+    "xxd", "hexdump", "od", "strings",
+    "jq", "yq", "xargs",
+    "curl", "wget",
+}
+
+# Git subcommands that are NOT read-only (modify state)
+GIT_WRITE_SUBCOMMANDS = {
+    "add", "commit", "push", "pull", "fetch", "merge", "rebase",
+    "reset", "checkout", "switch", "restore", "cherry-pick", "revert",
+    "stash", "tag", "branch", "clean", "rm", "mv", "init", "clone",
+    "submodule", "bisect", "am", "apply", "format-patch",
+}
+
+# gh (GitHub CLI) write actions — any action verb that modifies state
+GH_WRITE_ACTIONS = {
+    "create", "merge", "close", "reopen", "edit", "comment", "review",
+    "delete", "login", "logout", "setup-git", "enable", "disable",
+    "approve", "ready", "archive", "unarchive", "transfer",
+    "lock", "unlock", "pin", "unpin", "label", "set-default",
+    "sync",
+}
+
+# Package manager write subcommands
+PKG_WRITE_SUBCOMMANDS = {
+    # npm / yarn / pnpm / bun
+    "install", "uninstall", "add", "remove", "update", "upgrade",
+    "publish", "init", "create", "link", "unlink", "pack", "exec",
+    "run", "start", "test", "build", "deploy", "prune", "dedupe",
+    "cache", "config", "set",
+    # pip / uv
+    "install", "uninstall", "download", "freeze",  # freeze is read but outputs
+    # cargo
+    "build", "run", "test", "bench", "install", "uninstall", "publish",
+    "new", "init", "add", "remove", "fix", "clean", "doc", "update",
+    # go
+    "build", "run", "test", "install", "get", "mod", "generate", "clean",
+    # rustup
+    "install", "uninstall", "update", "default", "override",
+}
 
 # Commands that delete or destroy data
 DESTRUCTIVE_COMMANDS = {
@@ -154,6 +221,86 @@ def _all_git_recoverable(paths: list[str]) -> bool:
     return True
 
 
+def _extract_base_cmd(part: str) -> tuple[str, list[str]]:
+    """Extract the base command name and tokens from a command part.
+
+    Skips leading env vars and sudo.
+    Returns (base_cmd, tokens_from_cmd_onwards).
+    """
+    tokens = part.split()
+    idx = 0
+    while idx < len(tokens):
+        tok = tokens[idx]
+        if "=" in tok and not tok.startswith("-"):
+            idx += 1
+            continue
+        if tok == "sudo":
+            idx += 1
+            continue
+        break
+    if idx >= len(tokens):
+        return "", []
+    return os.path.basename(tokens[idx]), tokens[idx:]
+
+
+def _has_write_subcommand(base_cmd: str, cmd_tokens: list[str]) -> bool:
+    """Check if a command with subcommands has a write action.
+
+    For commands like git, gh, npm etc. that have read/write subcommands.
+    Returns True if any subcommand indicates a write operation.
+    """
+    if len(cmd_tokens) < 2:
+        return False  # No subcommand → info/help → read-only
+
+    sub = cmd_tokens[1]
+
+    if base_cmd == "git":
+        return sub in GIT_WRITE_SUBCOMMANDS
+
+    if base_cmd == "gh":
+        # gh <resource> <action>: e.g. gh pr create, gh auth status
+        # Check both sub (resource-level) and action (verb-level)
+        if sub in GH_WRITE_ACTIONS:
+            return True
+        if len(cmd_tokens) >= 3 and cmd_tokens[2] in GH_WRITE_ACTIONS:
+            return True
+        return False
+
+    if base_cmd in ("npm", "npx", "yarn", "pnpm", "bun",
+                     "pip", "pip3", "pipx", "uv",
+                     "cargo", "rustup", "go"):
+        return sub in PKG_WRITE_SUBCOMMANDS
+
+    return False
+
+
+def _is_readonly_bash(command: str) -> bool:
+    """Check if ALL parts of a Bash command are read-only.
+
+    Returns True only when every sub-command in the pipeline/chain is
+    a known read-only command. Returns False if any part is unknown or
+    writes data.
+    """
+    parts = re.split(r"\|\||&&|;|\||\n", command)
+    for part in parts:
+        stripped = part.strip()
+        if not stripped:
+            continue
+
+        base_cmd, cmd_tokens = _extract_base_cmd(stripped)
+        if not base_cmd:
+            continue
+
+        if base_cmd not in READONLY_COMMANDS:
+            return False
+
+        # For commands with subcommands, check if the action is a write
+        if _has_write_subcommand(base_cmd, cmd_tokens):
+            return False
+
+    return True
+
+
 def _needs_discord_approval_bash(command: str) -> bool:
     """Check if a Bash command needs Discord approval.
 
@@ -173,21 +320,9 @@ def _needs_discord_approval_bash(command: str) -> bool:
             if re.search(pattern, stripped):
                 return True
 
-        # Extract the base command name (skip env vars and sudo)
-        tokens = stripped.split()
-        idx = 0
-        while idx < len(tokens):
-            tok = tokens[idx]
-            if "=" in tok and not tok.startswith("-"):
-                idx += 1
-                continue
-            if tok == "sudo":
-                idx += 1
-                continue
-            break
-        if idx >= len(tokens):
+        base_cmd, _ = _extract_base_cmd(stripped)
+        if not base_cmd:
             continue
-        base_cmd = os.path.basename(tokens[idx])
 
         if base_cmd in DESTRUCTIVE_COMMANDS:
             targets = _parse_rm_targets(stripped)
@@ -213,17 +348,21 @@ def main() -> None:
 
     _log(f"START tool={tool_name} session={session_id}")
 
-    # Check if this is a destructive Bash command that needs Discord approval
+    # Determine which tools need Discord approval.
+    # - AskUserQuestion: always forwarded to Discord
+    # - Bash: forwarded unless ALL sub-commands are read-only
+    # - Everything else (Read, Write, Edit, Glob, Grep, etc.): auto-allowed
     needs_discord = False
     if tool_name == "AskUserQuestion":
         needs_discord = True
     elif tool_name == "Bash":
         command = tool_input.get("command", "")
-        if _needs_discord_approval_bash(command):
-            _log(f"DESTRUCTIVE_BASH: {command}")
-            needs_discord = True
+        if _is_readonly_bash(command):
+            _log(f"AUTO_ALLOW_READONLY tool=Bash cmd={command[:80]}")
+            print(json.dumps({"decision": "allow"}))
+            return
+        needs_discord = True
 
-    # Non-destructive operations are auto-allowed
     if not needs_discord:
         _log(f"AUTO_ALLOW tool={tool_name}")
         print(json.dumps({"decision": "allow"}))
